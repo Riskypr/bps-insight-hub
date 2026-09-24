@@ -1,0 +1,31 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model PdfFile {
+  id           String   @id @default(uuid())
+  filename     String   @db.VarChar(255)
+  originalName String   @map("original_name") @db.VarChar(255)
+  title        String?  @db.VarChar(255)
+  category     String   @default("Dokumen Umum") @db.VarChar(100)
+  fileSize     Int      @map("file_size")
+  mimeType     String   @default("application/pdf") @map("mime_type")
+  fileHash     String   @unique @map("file_hash") @db.VarChar(64)
+  fileUrl      String   @map("file_url")
+  storageKey   String   @map("storage_key")
+  uploadedBy   String?  @map("uploaded_by")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@index([createdAt])
+  @@index([originalName])
+  @@index([title])
+  @@index([category])
+  @@map("pdf_files")
+}

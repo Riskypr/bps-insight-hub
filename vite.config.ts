@@ -12,27 +12,30 @@ import type { Plugin } from "vite";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-/** Load .env into process.env before Hono import */
+/** Load .env and .env.local into process.env before Hono import */
 function loadEnvFile() {
-  try {
-    const envPath = resolve(__dirname, ".env");
-    const content = readFileSync(envPath, "utf-8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim();
-      if (!process.env[key]) process.env[key] = val;
-    }
-  } catch { /* no .env file */ }
+  for (const filename of [".env", ".env.local"]) {
+    try {
+      const envPath = resolve(__dirname, filename);
+      const content = readFileSync(envPath, "utf-8");
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const eqIdx = trimmed.indexOf("=");
+        if (eqIdx === -1) continue;
+        const key = trimmed.slice(0, eqIdx).trim();
+        let val = trimmed.slice(eqIdx + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        process.env[key] = val;
+      }
+    } catch { /* file not found */ }
+  }
 }
 
 /** Mount Hono API at /api/* during dev */
 function honoApiPlugin(): Plugin {
-  let appPromise: Promise<typeof import("./api/index.ts")> | null = null;
-
   return {
     name: "hono-api",
     configureServer(server) {
@@ -40,47 +43,55 @@ function honoApiPlugin(): Plugin {
       loadEnvFile();
 
       server.middlewares.use("/api", async (req, res) => {
-        if (!appPromise) {
-          appPromise = import("./api/index.ts");
-        }
-        const { default: app } = await appPromise;
-        // Vite passes full URL — strip /api prefix for Hono routing
-        const rawUrl = req.url ?? "/";
-        const strippedUrl = rawUrl.startsWith("/api") ? rawUrl.slice(4) || "/" : rawUrl;
-        const url = new URL(strippedUrl, `http://${req.headers.host ?? "localhost"}`);
-        const headers = new Headers();
-        for (const [key, val] of Object.entries(req.headers)) {
-          if (val) headers.set(key, Array.isArray(val) ? val.join(", ") : val);
-        }
+        try {
+          const mod = await server.ssrLoadModule("./api/index.ts");
+          const app = mod.default;
+          // Vite passes stripped URL or full URL — ensure proper path for Hono
+          const rawUrl = req.url ?? "/";
+          const strippedUrl = rawUrl.startsWith("/api") ? rawUrl.slice(4) || "/" : rawUrl;
+          const url = new URL(strippedUrl, `http://${req.headers.host ?? "localhost"}`);
+          const headers = new Headers();
+          for (const [key, val] of Object.entries(req.headers)) {
+            if (val) headers.set(key, Array.isArray(val) ? val.join(", ") : val);
+          }
 
-        let body: BodyInit | undefined;
-        if (req.method !== "GET" && req.method !== "HEAD") {
-          const chunks: Buffer[] = [];
-          for await (const chunk of req) chunks.push(chunk);
-          body = Buffer.concat(chunks);
-        }
+          let body: BodyInit | undefined;
+          if (req.method !== "GET" && req.method !== "HEAD") {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) chunks.push(chunk);
+            body = Buffer.concat(chunks);
+          }
 
-        const request = new Request(url.toString(), {
-          method: req.method,
-          headers,
-          body,
-        });
+          const request = new Request(url.toString(), {
+            method: req.method,
+            headers,
+            body,
+          });
 
-        const response = await app.fetch(request);
+          const response = await app.fetch(request);
 
-        // Pipe response back to Node.js
-        res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
-        if (response.body) {
-          const reader = response.body.getReader();
-          const pump = async (): Promise<void> => {
-            const { done, value } = await reader.read();
-            if (done) { res.end(); return; }
-            res.write(value);
-            return pump();
-          };
-          await pump();
-        } else {
-          res.end();
+          // Pipe response back to Node.js
+          res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+          if (response.body) {
+            const reader = response.body.getReader();
+            const pump = async (): Promise<void> => {
+              const { done, value } = await reader.read();
+              if (done) { res.end(); return; }
+              res.write(value);
+              return pump();
+            };
+            await pump();
+          } else {
+            res.end();
+          }
+        } catch (err: unknown) {
+          console.error("[Hono middleware error]:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: false, error: err instanceof Error ? err.message : "Internal server error" }));
+          } else {
+            res.end();
+          }
         }
       });
     },

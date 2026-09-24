@@ -1,4 +1,4 @@
-import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useRef, useState } from "react";
 import { Link, createFileRoute } from "@tanstack/react-router";
 import { FileText, FileUp, LoaderCircle, UploadCloud, X } from "lucide-react";
 import { toast } from "sonner";
@@ -14,7 +14,8 @@ import {
 } from "@/components/ui/select";
 import { PageHeader } from "@/components/common";
 import { cn } from "@/lib/utils";
-import { categoryFromTitle, formatFileSize, ragDocumentStore } from "@/lib/rag-document-store";
+import { api } from "@/lib/api";
+import { categoryFromTitle, formatFileSize } from "@/lib/rag-document-store";
 
 export const Route = createFileRoute("/_shell/rag-documents")({ component: RagDocuments });
 
@@ -35,20 +36,6 @@ function RagDocuments() {
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
-
-  useEffect(() => {
-    if (!isUploading) return;
-    const timer = window.setInterval(() => {
-      setPendingFiles((current) =>
-        current.map((item) => {
-          if (item.progress >= 100) return item;
-          const progress = Math.min(item.progress + 9, 100);
-          return { ...item, progress, status: progress >= 75 ? "Mengindeks" : "Mengunggah" };
-        }),
-      );
-    }, 240);
-    return () => window.clearInterval(timer);
-  }, [isUploading]);
 
   const addFiles = (files: FileList | File[]) => {
     const allFiles = Array.from(files);
@@ -90,56 +77,69 @@ function RagDocuments() {
       current.map((item) => (item.id === id ? { ...item, ...changes } : item)),
     );
 
-  const uploadBatch = () => {
+  const uploadBatch = async () => {
     if (!pendingFiles.length) return;
     setIsUploading(true);
-    const start = pendingFiles.map((item) => ({
-      ...item,
-      status: "Mengunggah" as const,
-      progress: 5,
-    }));
-    setPendingFiles(start);
-    ragDocumentStore.add(
-      start.map((item) => ({
-        id: item.id,
-        name: `${item.title.trim() || item.file.name.replace(/\.pdf$/i, "")}.pdf`,
+
+    // Show uploading state immediately
+    setPendingFiles((current) =>
+      current.map((item) => ({ ...item, status: "Mengunggah" as const, progress: 10 })),
+    );
+
+    try {
+      const files = pendingFiles.map((item) => item.file);
+      const metadata = pendingFiles.map((item) => ({
+        title: item.title.trim() || item.file.name.replace(/\.pdf$/i, ""),
         category: item.category,
-        size: formatFileSize(item.file.size),
-        pages: Math.max(1, Math.round(item.file.size / 55_000)),
-        uploadedAt: "Baru saja",
-        status: "Mengunggah" as const,
-        progress: 5,
-      })),
-    );
-    const syncProgress = window.setInterval(
-      () =>
-        setPendingFiles((current) => {
-          current.forEach((item) =>
-            ragDocumentStore.update(item.id, {
-              progress: item.progress,
-              status: item.progress >= 75 ? "Mengindeks" : "Mengunggah",
-            }),
-          );
-          return current;
-        }),
-      260,
-    );
-    window.setTimeout(() => {
-      window.clearInterval(syncProgress);
-      start.forEach((item) =>
-        ragDocumentStore.update(item.id, { progress: 100, status: "Siap digunakan" }),
-      );
+      }));
+
+      // Show indexing state while waiting for server
       setPendingFiles((current) =>
-        current.map((item) => ({ ...item, progress: 100, status: "Mengindeks" })),
+        current.map((item) => ({ ...item, status: "Mengindeks" as const, progress: 60 })),
       );
-      window.setTimeout(() => {
-        setPendingFiles([]);
-        setIsUploading(false);
-        toast.success("Unggahan batch selesai", {
-          description: `${start.length} dokumen siap digunakan oleh AI.`,
+
+      const response = await api.pdfs.upload(files, metadata);
+
+      // Mark 100%
+      setPendingFiles((current) =>
+        current.map((item) => ({ ...item, progress: 100 })),
+      );
+
+      const { summary } = response;
+
+      // Inform user with summary toast
+      if (summary.uploaded > 0 && summary.skipped === 0 && summary.failed === 0) {
+        toast.success("Unggahan selesai", {
+          description: `${summary.uploaded} dokumen berhasil diunggah dan siap digunakan AI.`,
         });
-      }, 450);
-    }, 2800);
+      } else if (summary.uploaded === 0 && summary.skipped > 0 && summary.failed === 0) {
+        toast.warning("Semua file sudah ada", {
+          description: `${summary.skipped} file terdeteksi sebagai duplikat dan dilewati.`,
+        });
+      } else {
+        const parts: string[] = [];
+        if (summary.uploaded) parts.push(`${summary.uploaded} berhasil`);
+        if (summary.skipped) parts.push(`${summary.skipped} duplikat`);
+        if (summary.failed) parts.push(`${summary.failed} gagal`);
+        toast.info("Unggahan selesai", { description: parts.join(", ") + "." });
+      }
+
+      // Individual FAILED toasts
+      for (const item of response.data) {
+        if (item.status === "FAILED") {
+          toast.error(`Gagal: ${item.originalName}`, { description: item.reason });
+        }
+      }
+    } catch (error: unknown) {
+      toast.error("Upload gagal", {
+        description: error instanceof Error ? error.message : "Terjadi kesalahan server.",
+      });
+    } finally {
+      // Small delay so progress bar reaches 100% before clearing
+      await new Promise((resolve) => window.setTimeout(resolve, 400));
+      setPendingFiles([]);
+      setIsUploading(false);
+    }
   };
 
   return (
