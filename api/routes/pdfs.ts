@@ -8,6 +8,30 @@ const MAX_FILE_SIZE = Number(process.env.PDF_MAX_FILE_SIZE_BYTES ?? 25 * 1024 * 
 const BOT_API_KEY = process.env.PDF_BOT_API_KEY;
 const uploadRequests = new Map<string, number[]>();
 
+// ── In-memory search cache (TTL 30s) ─────────────────────────────────────────
+const CACHE_TTL_MS = 30_000;
+type CacheEntry = { data: unknown; meta: unknown; expires: number };
+const searchCache = new Map<string, CacheEntry>();
+
+function cacheGet(key: string): CacheEntry | undefined {
+  const entry = searchCache.get(key);
+  if (!entry) return undefined;
+  if (Date.now() > entry.expires) { searchCache.delete(key); return undefined; }
+  return entry;
+}
+
+function cacheSet(key: string, data: unknown, meta: unknown) {
+  // Evict oldest entries if cache grows beyond 200 keys
+  if (searchCache.size >= 200) {
+    const oldest = [...searchCache.entries()].sort((a, b) => a[1].expires - b[1].expires)[0];
+    if (oldest) searchCache.delete(oldest[0]);
+  }
+  searchCache.set(key, { data, meta, expires: Date.now() + CACHE_TTL_MS });
+}
+
+function cacheClear() { searchCache.clear(); }
+// ─────────────────────────────────────────────────────────────────────────────
+
 type FileMetadata = { title?: string; category?: string };
 
 function downloadUrl(origin: string, id: string) {
@@ -113,6 +137,7 @@ pdfRoutes.post("/upload", async (c) => {
   const uploaded = results.filter((item) => item.status === "SUCCESS").length;
   const skipped = results.filter((item) => item.status === "SKIPPED").length;
   const failed = results.length - uploaded - skipped;
+  cacheClear(); // invalidate list cache after upload
   return c.json({ success: failed === 0, message: "Upload process completed", summary: { total: files.length, uploaded, skipped, failed }, data: results }, failed ? 207 : 200);
 });
 
@@ -126,53 +151,61 @@ pdfRoutes.post("/check-duplicate", async (c) => {
   return c.json({ duplicates: body.hashes.map((hash) => ({ hash, exists: byHash.has(hash), ...(byHash.has(hash) ? { fileId: byHash.get(hash) } : {}) })) });
 });
 
+type SearchRow = {
+  id: string; filename: string; original_name: string; title: string | null;
+  category: string; file_size: number; mime_type: string; file_hash: string;
+  file_url: string; storage_key: string; uploaded_by: string | null;
+  created_at: Date; updated_at: Date; total_count: bigint;
+};
+
+function mapRow(r: SearchRow) {
+  return {
+    id: r.id, filename: r.filename, originalName: r.original_name, title: r.title,
+    category: r.category, fileSize: r.file_size, mimeType: r.mime_type,
+    fileHash: r.file_hash, fileUrl: r.file_url, storageKey: r.storage_key,
+    uploadedBy: r.uploaded_by, createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
 pdfRoutes.get("/", async (c) => {
   const page = Math.max(1, Number(c.req.query("page") ?? 1) || 1);
   const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? 10) || 10));
   const search = c.req.query("search")?.trim();
   const offset = (page - 1) * limit;
 
+  // ── Cache lookup ────────────────────────────────────────────────────────────
+  const cacheKey = `${search ?? ""}:${page}:${limit}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return c.json({ success: true, cached: true, data: cached.data, meta: cached.meta });
+
   if (search) {
+    // Single query: data + count in one round-trip via window function.
+    // GIN trigram index (pg_trgm) makes ILIKE fast even with leading wildcard.
     const pattern = `%${search.replace(/[%_\\]/g, "\\$&")}%`;
-    const [data, countResult] = await Promise.all([
-      prisma.$queryRaw<
-        Array<{
-          id: string; filename: string; original_name: string; title: string | null;
-          category: string; file_size: number; mime_type: string; file_hash: string;
-          file_url: string; storage_key: string; uploaded_by: string | null;
-          created_at: Date; updated_at: Date;
-        }>
-      >`
-        SELECT * FROM pdf_files
-        WHERE original_name ILIKE ${pattern}
-           OR title ILIKE ${pattern}
-           OR category ILIKE ${pattern}
-        ORDER BY created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `,
-      prisma.$queryRaw<[{ count: bigint }]>`
-        SELECT COUNT(*) AS count FROM pdf_files
-        WHERE original_name ILIKE ${pattern}
-           OR title ILIKE ${pattern}
-           OR category ILIKE ${pattern}
-      `,
-    ]);
-    const totalItems = Number(countResult[0].count);
-    // Map snake_case columns back to camelCase to keep response shape consistent
-    const mapped = data.map((r) => ({
-      id: r.id, filename: r.filename, originalName: r.original_name, title: r.title,
-      category: r.category, fileSize: r.file_size, mimeType: r.mime_type,
-      fileHash: r.file_hash, fileUrl: r.file_url, storageKey: r.storage_key,
-      uploadedBy: r.uploaded_by, createdAt: r.created_at, updatedAt: r.updated_at,
-    }));
-    return c.json({ success: true, data: mapped, meta: { currentPage: page, totalPages: Math.max(1, Math.ceil(totalItems / limit)), totalItems } });
+    const rows = await prisma.$queryRaw<SearchRow[]>`
+      SELECT *, COUNT(*) OVER() AS total_count
+      FROM pdf_files
+      WHERE original_name ILIKE ${pattern}
+         OR title        ILIKE ${pattern}
+         OR category     ILIKE ${pattern}
+      ORDER BY created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    const totalItems = rows.length > 0 ? Number(rows[0].total_count) : 0;
+    const data = rows.map(mapRow);
+    const meta = { currentPage: page, totalPages: Math.max(1, Math.ceil(totalItems / limit)), totalItems };
+    cacheSet(cacheKey, data, meta);
+    return c.json({ success: true, data, meta });
   }
 
+  // No search — use Prisma ORM path (still gets cached)
   const [data, totalItems] = await Promise.all([
     prisma.pdfFile.findMany({ orderBy: { createdAt: "desc" }, skip: offset, take: limit }),
     prisma.pdfFile.count(),
   ]);
-  return c.json({ success: true, data, meta: { currentPage: page, totalPages: Math.max(1, Math.ceil(totalItems / limit)), totalItems } });
+  const meta = { currentPage: page, totalPages: Math.max(1, Math.ceil(totalItems / limit)), totalItems };
+  cacheSet(cacheKey, data, meta);
+  return c.json({ success: true, data, meta });
 });
 
 pdfRoutes.get("/bot/latest", async (c) => {
@@ -199,6 +232,7 @@ pdfRoutes.delete("/:id", async (c) => {
   try {
     await pdfStorage.remove(record.storageKey);
     await prisma.pdfFile.delete({ where: { id: record.id } });
+    cacheClear(); // invalidate list cache after delete
     return c.json({ success: true, message: "PDF file and associated records successfully deleted", deletedId: record.id });
   } catch (error) {
     console.error("PDF deletion failed", error);
