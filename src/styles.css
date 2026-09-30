@@ -89,9 +89,12 @@
   --bps-green-soft: oklch(0.26 0.05 156);
 
   /* bps-blue tokens REMAPPED to warm orange for the dark theme */
-  --bps-blue: oklch(0.75 0.16 55); /* orange primary */
-  --bps-blue-soft: oklch(0.24 0.05 50); /* subtle warm bg */
-  --bps-blue-deep: oklch(0.92 0.06 60); /* light orange text on dark */
+  --bps-blue: oklch(0.75 0.16 55);
+  /* orange primary */
+  --bps-blue-soft: oklch(0.24 0.05 50);
+  /* subtle warm bg */
+  --bps-blue-deep: oklch(0.92 0.06 60);
+  /* light orange text on dark */
 
   /* Core palette - warm dark */
   --background: oklch(0.145 0.012 50);
@@ -140,9 +143,12 @@
  * bps-blue tokens also show orange to stay consistent.
  */
 .light {
-  --bps-blue: oklch(0.65 0.18 52); /* slightly deeper for contrast on white */
-  --bps-blue-soft: oklch(0.96 0.04 55); /* warm tinted bg */
-  --bps-blue-deep: oklch(0.35 0.1 50); /* dark orange for text */
+  --bps-blue: oklch(0.65 0.18 52);
+  /* slightly deeper for contrast on white */
+  --bps-blue-soft: oklch(0.96 0.04 55);
+  /* warm tinted bg */
+  --bps-blue-deep: oklch(0.35 0.1 50);
+  /* dark orange for text */
   --bps-orange-soft: oklch(0.96 0.04 55);
 
   --background: oklch(0.985 0.003 60);
@@ -214,6 +220,7 @@
     transform 180ms ease,
     box-shadow 180ms ease,
     border-color 180ms ease;
+
   &:hover {
     transform: translateY(-2px);
     box-shadow: var(--shadow-lift);
@@ -230,6 +237,7 @@
     opacity: 0;
     transform: translateY(6px);
   }
+
   to {
     opacity: 1;
     transform: none;
@@ -241,10 +249,12 @@
 }
 
 @keyframes bps-blink {
+
   0%,
   100% {
     opacity: 0.25;
   }
+
   50% {
     opacity: 1;
   }
@@ -256,12 +266,14 @@
 
 /* Typing indicator dots */
 @keyframes bps-typing {
+
   0%,
   60%,
   100% {
     opacity: 0.3;
     transform: translateY(0);
   }
+
   30% {
     opacity: 1;
     transform: translateY(-3px);
@@ -276,9 +288,11 @@
   background: var(--bps-blue);
   animation: bps-typing 1.2s ease-in-out infinite;
 }
+
 .typing-dot:nth-child(2) {
   animation-delay: 0.15s;
 }
+
 .typing-dot:nth-child(3) {
   animation-delay: 0.3s;
 }
@@ -288,6 +302,7 @@
   0% {
     background-position: -400px 0;
   }
+
   100% {
     background-position: 400px 0;
   }
@@ -306,6 +321,7 @@
     opacity: 0;
     transform: translateY(8px) scale(0.97);
   }
+
   to {
     opacity: 1;
     transform: none;
@@ -322,6 +338,7 @@
     opacity: 0;
     transform: translateY(10px);
   }
+
   to {
     opacity: 1;
     transform: none;
@@ -338,10 +355,12 @@
     box-shadow: 0 0 0 2px var(--bps-blue);
     background-color: color-mix(in srgb, var(--bps-blue) 8%, transparent);
   }
+
   60% {
     box-shadow: 0 0 0 2px var(--bps-blue);
     background-color: color-mix(in srgb, var(--bps-blue) 6%, transparent);
   }
+
   100% {
     box-shadow: 0 0 0 2px transparent;
     background-color: transparent;
