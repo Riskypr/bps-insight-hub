@@ -1,16 +1,7 @@
 import { BpsWordmark } from "@/components/bps-logo";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
   Sidebar,
   SidebarContent,
-  SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
   SidebarHeader,
@@ -23,15 +14,11 @@ import type { ConversationItem } from "@/hooks/use-chat";
 import { cn } from "@/lib/utils";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import {
-  ChevronDown,
   FileUp,
   FolderOpen,
-  LogOut,
   MessageSquare,
   Pencil,
   Plus,
-  Settings,
-  User,
 } from "lucide-react";
 import { useRef, useState } from "react";
 
@@ -45,7 +32,7 @@ export function AppSidebar({
   onNewChat: () => void;
   onSelectConversation: (id: string) => void;
   onRenameConversation: (id: string, title: string) => void;
-  activeConversationId?: string;
+  activeConversationId?: string | undefined;
   conversations?: ConversationItem[];
 }) {
   const { state, isMobile, setOpenMobile } = useSidebar();
@@ -194,49 +181,6 @@ export function AppSidebar({
           </SidebarMenu>
         </div>
       </SidebarContent>
-
-      <SidebarFooter className="gap-2">
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button className="flex w-full items-center gap-2.5 rounded-xl border bg-surface-2 p-2 transition-all hover:bg-surface-3">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-bps-blue text-xs font-semibold text-primary-foreground">
-                PB
-              </div>
-              {!collapsed && (
-                <div className="min-w-0 leading-tight">
-                  <div className="truncate text-[13px] font-medium">Pegawai BPS</div>
-                  <div className="truncate text-[11px] text-muted-foreground">
-                    BPS Kalimantan Tengah
-                  </div>
-                </div>
-              )}
-              <ChevronDown className="ml-auto h-4 w-4 shrink-0 opacity-50" />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-56">
-            <DropdownMenuLabel className="font-normal">
-              <div className="flex flex-col space-y-1">
-                <p className="text-sm font-medium">Pegawai BPS</p>
-                <p className="text-xs text-muted-foreground">BPS Kalimantan Tengah</p>
-              </div>
-            </DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem>
-              <User className="mr-2 h-4 w-4" />
-              <span>Profil</span>
-            </DropdownMenuItem>
-            <DropdownMenuItem>
-              <Settings className="mr-2 h-4 w-4" />
-              <span>Pengaturan</span>
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={() => void navigate({ to: "/" })}>
-              <LogOut className="mr-2 h-4 w-4" />
-              <span>Keluar</span>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </SidebarFooter>
     </Sidebar>
   );
 }

@@ -4,7 +4,7 @@ type Theme = "dark" | "light";
 
 /**
  * Hook to manage theme (dark/light) with localStorage persistence.
- * Default is "dark" (BPS orange identity).
+ * Default is "dark" (BPS blue identity).
  */
 export function useTheme() {
   const [theme, setThemeState] = useState<Theme>("dark");

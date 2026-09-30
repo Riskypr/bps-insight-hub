@@ -265,7 +265,7 @@ export function ChatWorkspace({
                   };
 
                   return count === 0 ? (
-                    <span className="text-xs text-bps-orange">
+                    <span className="text-xs text-muted-foreground">
                       Tidak ada pesan yang cocok
                     </span>
                   ) : (
@@ -785,7 +785,7 @@ function MoversTable() {
           </TableHeader>
           <TableBody>
             {answerData.regionMovers.map((r) => (
-              <TableRow key={r.region} className={cn(r.delta === min && "bg-bps-orange-soft/60")}>
+              <TableRow key={r.region} className={cn(r.delta === min && "bg-bps-blue-soft/60")}>
                 <TableCell className="font-medium">{r.region}</TableCell>
                 <TableCell className="text-right tabular-nums">{r.y2020.toFixed(2)}</TableCell>
                 <TableCell className="text-right tabular-nums">{r.y2025.toFixed(2)}</TableCell>
