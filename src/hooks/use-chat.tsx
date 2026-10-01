@@ -4,13 +4,25 @@ import { useCallback, useRef, useState } from "react";
 export type AiAnswer = {
   text: string;
   blocks: string[];
-  insight?: string;
-  sources: { kind: string; title: string; meta: string }[];
-  suggestions?: string[];
+  insight?: string | undefined;
+  sources: {
+    kind: string;
+    title: string;
+    meta: string;
+    link?: string | undefined;
+    rawScore?: number | null | undefined;
+    pages?: string[] | undefined;
+    citedPages?: string[] | undefined;
+  }[];
+  suggestions?: string[] | undefined;
+  warning?: string | null | undefined;
+  note?: string | null | undefined;
+  featuredImage?: { url: string; page?: string | undefined; title?: string | undefined } | null | undefined;
+  mode?: string | undefined;
 };
 
 export type ChatMessage =
-  | { id: string; role: "user"; text: string; attachment?: { name: string; type: string }; createdAt: number }
+  | { id: string; role: "user"; text: string; attachment?: { name: string; type: string } | undefined; createdAt: number }
   | { id: string; role: "assistant"; answer: AiAnswer; createdAt: number };
 
 export type ConversationItem = {
@@ -28,9 +40,14 @@ function extractSuggestions(text: string): { cleanText: string; suggestions: str
   let i = lines.length - 1;
 
   // Walk backwards from end, collect `- ` prefixed lines
-  while (i >= 0 && /^\s*-\s+/.test(lines[i])) {
-    suggestions.unshift(lines[i].replace(/^\s*-\s+/, "").trim());
-    i--;
+  while (i >= 0) {
+    const line = lines[i];
+    if (line !== undefined && /^\s*-\s+/.test(line)) {
+      suggestions.unshift(line.replace(/^\s*-\s+/, "").trim());
+      i--;
+    } else {
+      break;
+    }
   }
 
   // Remove the suggestion lines from text
@@ -40,7 +57,7 @@ function extractSuggestions(text: string): { cleanText: string; suggestions: str
 
 /**
  * Custom hook to manage the BPS AI chat state.
- * Uses real AI API with streaming support.
+ * Uses real Python chat.py RAG backend with streaming support.
  */
 export function useChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -52,7 +69,7 @@ export function useChat() {
   const conversationsRef = useRef<Map<string, ChatMessage[]>>(new Map());
 
   // Auto-save messages when they change and we have a conversationId
-  const activeConvId = useRef<string | undefined>();
+  const activeConvId = useRef<string | undefined>(undefined);
   activeConvId.current = conversationId;
   if (conversationId && messages.length > 0) {
     conversationsRef.current.set(conversationId, messages);
@@ -63,15 +80,17 @@ export function useChat() {
       const text = rawText.trim();
       if (!text || stage !== null) return;
 
-      const userMsg: ChatMessage = { id: uid(), role: "user", text };
+      const userMsg: ChatMessage = { id: uid(), role: "user", text, createdAt: Date.now() };
       setMessages((prev) => [...prev, userMsg]);
       setStage(0);
+
+      let aiId: string | null = null;
 
       try {
         // Build history AFTER adding user message
         const history = messages.map((m) => {
-          if (m.role === "user") return { role: "user" as const, content: m.text };
-          return { role: "assistant" as const, content: m.answer.text };
+          if (m.role === "assistant") return { role: "assistant" as const, content: m.answer.text };
+          return { role: "user" as const, content: m.text };
         });
         const apiMessages = [...history, { role: "user" as const, content: text }];
 
@@ -83,11 +102,30 @@ export function useChat() {
         const reader = stream.getReader();
         let fullText = "";
         let convId = conversationId;
-        let aiId: string | null = null;
+        let latestSources: AiAnswer["sources"] = [];
+        let latestWarning: string | null = null;
+        let latestNote: string | null = null;
+        let latestFeaturedImage: AiAnswer["featuredImage"] = null;
+        let latestMode: string | undefined = undefined;
 
         for await (const event of parseSSEStream(reader)) {
           if (event.type === "meta") {
-            convId = event.conversationId;
+            if (event.conversationId) convId = event.conversationId;
+            if (event.sources && event.sources.length > 0) {
+              latestSources = event.sources.map((s) => ({
+                kind: s.kind || "Publikasi BPS",
+                title: s.title,
+                meta: s.meta,
+                link: s.link,
+                rawScore: s.rawScore,
+                pages: s.pages,
+                citedPages: s.citedPages,
+              }));
+            }
+            if (event.warning !== undefined) latestWarning = event.warning;
+            if (event.note !== undefined) latestNote = event.note;
+            if (event.featuredImage !== undefined) latestFeaturedImage = event.featuredImage;
+            if (event.mode !== undefined) latestMode = event.mode;
           } else if (event.type === "token") {
             // Create AI placeholder on FIRST token (not before)
             if (!aiId) {
@@ -104,7 +142,7 @@ export function useChat() {
             fullText += event.content;
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === aiId
+                m.id === aiId && m.role === "assistant"
                   ? { ...m, answer: { ...m.answer, text: fullText } }
                   : m,
               ),
@@ -114,13 +152,25 @@ export function useChat() {
 
         setConversationId(convId);
 
-        // Extract suggestions from final text
+        // Extract suggestions from final text & attach sources and metadata
         if (aiId) {
           const { cleanText, suggestions } = extractSuggestions(fullText);
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === aiId
-                ? { ...m, answer: { ...m.answer, text: cleanText, suggestions } }
+              m.id === aiId && m.role === "assistant"
+                ? {
+                    ...m,
+                    answer: {
+                      ...m.answer,
+                      text: cleanText,
+                      suggestions,
+                      sources: latestSources,
+                      warning: latestWarning,
+                      note: latestNote,
+                      featuredImage: latestFeaturedImage,
+                      mode: latestMode,
+                    },
+                  }
                 : m,
             ),
           );
@@ -141,7 +191,7 @@ export function useChat() {
         if (aiId) {
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === aiId
+              m.id === aiId && m.role === "assistant"
                 ? {
                     ...m,
                     answer: {
@@ -166,6 +216,7 @@ export function useChat() {
                 blocks: [],
                 sources: [],
               },
+              createdAt: Date.now(),
             },
           ]);
         }
@@ -185,9 +236,12 @@ export function useChat() {
         role: "user",
         text: message ?? `Mengunggah: ${file.name}`,
         attachment: { name: file.name, type: file.type },
+        createdAt: Date.now(),
       };
       setMessages((prev) => [...prev, userMsg]);
       setStage(0);
+
+      let aiId: string | null = null;
 
       try {
         const stream = await api.chat.upload(file, {
@@ -198,24 +252,43 @@ export function useChat() {
         const reader = stream.getReader();
         let fullText = "";
         let convId = conversationId;
-        let aiId: string | null = null;
+        let latestSources: AiAnswer["sources"] = [];
+        let latestWarning: string | null = null;
+        let latestNote: string | null = null;
+        let latestFeaturedImage: AiAnswer["featuredImage"] = null;
+        let latestMode: string | undefined = undefined;
 
         for await (const event of parseSSEStream(reader)) {
           if (event.type === "meta") {
-            convId = event.conversationId;
+            if (event.conversationId) convId = event.conversationId;
+            if (event.sources && event.sources.length > 0) {
+              latestSources = event.sources.map((s) => ({
+                kind: s.kind || "Publikasi BPS",
+                title: s.title,
+                meta: s.meta,
+                link: s.link,
+                rawScore: s.rawScore,
+                pages: s.pages,
+                citedPages: s.citedPages,
+              }));
+            }
+            if (event.warning !== undefined) latestWarning = event.warning;
+            if (event.note !== undefined) latestNote = event.note;
+            if (event.featuredImage !== undefined) latestFeaturedImage = event.featuredImage;
+            if (event.mode !== undefined) latestMode = event.mode;
           } else if (event.type === "token") {
             if (!aiId) {
               aiId = uid();
               setMessages((prev) => [
                 ...prev,
-                { id: aiId!, role: "assistant", answer: { text: "", blocks: [], sources: [] } },
+                { id: aiId!, role: "assistant", answer: { text: "", blocks: [], sources: [] }, createdAt: Date.now() },
               ]);
               setStage(null);
             }
             fullText += event.content;
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === aiId
+                m.id === aiId && m.role === "assistant"
                   ? { ...m, answer: { ...m.answer, text: fullText } }
                   : m,
               ),
@@ -224,6 +297,29 @@ export function useChat() {
         }
 
         setConversationId(convId);
+
+        if (aiId) {
+          const { cleanText, suggestions } = extractSuggestions(fullText);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiId && m.role === "assistant"
+                ? {
+                    ...m,
+                    answer: {
+                      ...m.answer,
+                      text: cleanText,
+                      suggestions,
+                      sources: latestSources,
+                      warning: latestWarning,
+                      note: latestNote,
+                      featuredImage: latestFeaturedImage,
+                      mode: latestMode,
+                    },
+                  }
+                : m,
+            ),
+          );
+        }
         setStage(null);
       } catch (err) {
         console.error("Upload error:", err);
@@ -231,7 +327,7 @@ export function useChat() {
         if (aiId) {
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === aiId
+              m.id === aiId && m.role === "assistant"
                 ? {
                     ...m,
                     answer: {
@@ -251,6 +347,7 @@ export function useChat() {
               id: errId,
               role: "assistant",
               answer: { text: `Maaf, terjadi kesalahan: ${errorMsg}`, blocks: [], sources: [] },
+              createdAt: Date.now(),
             },
           ]);
         }

@@ -271,12 +271,14 @@ const makeUserMsg = (text: string): ChatMessage => ({
   id: `u-${Math.random().toString(36).slice(2)}`,
   role: "user",
   text,
+  createdAt: Date.now(),
 });
 
 const makeAiMsg = (answer: AiAnswer): ChatMessage => ({
   id: `a-${Math.random().toString(36).slice(2)}`,
   role: "assistant",
   answer,
+  createdAt: Date.now(),
 });
 
 export const presetConversations: Record<string, ChatMessage[]> = {

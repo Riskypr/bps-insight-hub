@@ -5,7 +5,7 @@
 //     React/TanStack dedupe, error logger plugins, and sandbox detection (port/host/strictPort).
 // You can pass additional config via defineConfig({ vite: { ... }, etc... }) if needed.
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
-import { readFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
@@ -34,7 +34,7 @@ function loadEnvFile() {
   }
 }
 
-/** Mount Hono API at /api/* during dev */
+/** Mount Hono API at /api/* and static assets during dev */
 function honoApiPlugin(): Plugin {
   return {
     name: "hono-api",
@@ -42,9 +42,26 @@ function honoApiPlugin(): Plugin {
       // Ensure .env is loaded before Hono reads process.env
       loadEnvFile();
 
+      // Serve static SOP images and assets from back-end/static
+      server.middlewares.use("/static", (req, res, next) => {
+        try {
+          const relativePath = decodeURIComponent(req.url?.split("?")[0]?.replace(/^\//, "") ?? "");
+          const filePath = resolve(__dirname, "back-end/static", relativePath);
+          if (existsSync(filePath) && statSync(filePath).isFile()) {
+            if (filePath.endsWith(".png")) res.setHeader("Content-Type", "image/png");
+            else if (filePath.endsWith(".jpg") || filePath.endsWith(".jpeg")) res.setHeader("Content-Type", "image/jpeg");
+            createReadStream(filePath).pipe(res);
+            return;
+          }
+        } catch {
+          // ignore error and pass to next
+        }
+        next();
+      });
+
       server.middlewares.use("/api", async (req, res) => {
         try {
-          const mod = await server.ssrLoadModule("./api/index.ts");
+          const mod = (await server.ssrLoadModule("./api/index.ts")) as { default: any };
           const app = mod.default;
           // Vite passes stripped URL or full URL — ensure proper path for Hono
           const rawUrl = req.url ?? "/";
@@ -55,23 +72,29 @@ function honoApiPlugin(): Plugin {
             if (val) headers.set(key, Array.isArray(val) ? val.join(", ") : val);
           }
 
-          let body: BodyInit | undefined;
+          let body: Uint8Array | undefined;
           if (req.method !== "GET" && req.method !== "HEAD") {
             const chunks: Buffer[] = [];
             for await (const chunk of req) chunks.push(chunk);
-            body = Buffer.concat(chunks);
+            body = new Uint8Array(Buffer.concat(chunks));
           }
 
-          const request = new Request(url.toString(), {
+          const reqInit: Record<string, any> = {
             method: req.method,
             headers,
-            body,
-          });
+          };
+          if (body) {
+            reqInit["body"] = body;
+            reqInit["duplex"] = "half";
+          }
+
+          const request = new Request(url.toString(), reqInit as RequestInit);
 
           const response = await app.fetch(request);
 
           // Pipe response back to Node.js
-          res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+          const resHeaders = Object.fromEntries(response.headers.entries());
+          res.writeHead(response.status, resHeaders);
           if (response.body) {
             const reader = response.body.getReader();
             const pump = async (): Promise<void> => {

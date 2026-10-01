@@ -558,15 +558,52 @@ function AssistantMessage({ id, answer, index, searchQuery, onSend, createdAt }:
           </div>
         )}
 
+        {/* Warning Banner from chat.py */}
+        {answer.warning && (
+          <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-[13px] text-amber-900 dark:text-amber-200">
+            <div className="flex items-center gap-1.5 font-semibold">
+              <span>⚠️</span>
+              <span>Catatan Verifikasi Relevansi</span>
+            </div>
+            <p className="mt-1 leading-relaxed text-amber-800 dark:text-amber-300">{answer.warning}</p>
+          </div>
+        )}
+
+        {/* Note Banner from chat.py (e.g. combined sources) */}
+        {answer.note && (
+          <div className="rounded-xl border border-bps-blue/20 bg-bps-blue-soft/40 p-3.5 text-[13px] text-foreground/80">
+            <div className="flex items-center gap-1.5 font-semibold text-bps-blue">
+              <span>ℹ️</span>
+              <span>Informasi Sumber Publikasi</span>
+            </div>
+            <p className="mt-1 leading-relaxed">{answer.note}</p>
+          </div>
+        )}
+
+        {/* Featured Image (e.g. SOP table/diagram) */}
+        {answer.featuredImage && (
+          <div className="my-3 overflow-hidden rounded-xl border bg-surface p-3 shadow-sm">
+            <div className="mb-2 flex items-center justify-between text-xs font-medium text-muted-foreground">
+              <span>Diagram / Lampiran Dokumen {answer.featuredImage.page ? `(Hal. ${answer.featuredImage.page})` : ""}</span>
+              <span className="truncate max-w-[250px]">{answer.featuredImage.title}</span>
+            </div>
+            <img
+              src={answer.featuredImage.url}
+              alt={answer.featuredImage.title || "Lampiran dokumen BPS"}
+              className="max-h-[500px] w-full rounded-lg object-contain bg-background"
+            />
+          </div>
+        )}
+
         {/* Sources */}
         {answer.sources.length > 0 && (
           <div className="space-y-2">
             <div className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
               <span>📚</span>
-              <span>Sources & References</span>
+              <span>Sumber Publikasi Resmi BPS</span>
             </div>
-            {answer.sources.map((s) => (
-              <SourceCard key={s.title} {...s} />
+            {answer.sources.map((s, idx) => (
+              <SourceCard key={`${s.title}-${idx}`} {...s} link={s.link} />
             ))}
             <TrustNote />
           </div>
@@ -649,7 +686,7 @@ function Composer({
   input: string;
   setInput: (v: string) => void;
   onSend: (text?: string) => void;
-  onFileUpload?: (file: File, message?: string) => void;
+  onFileUpload?: ((file: File, message?: string) => void) | undefined;
   onKeyDown: (e: React.KeyboardEvent) => void;
   disabled: boolean;
   isCompact: boolean;

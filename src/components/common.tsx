@@ -140,10 +140,12 @@ export function SourceCard({
   kind,
   title,
   meta,
+  link,
 }: {
   kind: string;
   title: string;
   meta: string;
+  link?: string | undefined;
 }) {
   return (
     <div className="hover-lift flex items-center justify-between gap-4 rounded-xl border bg-surface-2 px-4 py-3">
@@ -157,9 +159,20 @@ export function SourceCard({
         <div className="truncate text-sm font-medium">{title}</div>
         <div className="truncate text-xs text-muted-foreground">{meta}</div>
       </div>
-      <Button variant="outline" size="sm" className="shrink-0">
-        View Source
-      </Button>
+      {link ? (
+        <Button
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          onClick={() => window.open(link, "_blank", "noopener,noreferrer")}
+        >
+          Buka Dokumen
+        </Button>
+      ) : (
+        <Button variant="outline" size="sm" className="shrink-0 text-muted-foreground" disabled>
+          Dokumen Internal
+        </Button>
+      )}
     </div>
   );
 }

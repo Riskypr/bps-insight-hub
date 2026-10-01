@@ -2,16 +2,9 @@ import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
 
-// ── Env config ──
-const AI_BASE = process.env.AI_API_BASE ?? "http://localhost:20128/v1";
-const AI_MODEL = process.env.AI_API_MODEL ?? "default";
-const AI_KEY = process.env.AI_API_KEY ?? "";
-
-function aiHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (AI_KEY) h["Authorization"] = `Bearer ${AI_KEY}`;
-  return h;
-}
+// ── Backend Python (chat.py) Configuration ──
+const CHAT_PY_URL =
+  process.env.CHAT_PY_URL ?? process.env.PYTHON_BACKEND_URL ?? "http://localhost:5000";
 
 const chatRoutes = new Hono();
 
@@ -39,283 +32,339 @@ const sendMessageSchema = z.object({
   max_tokens: z.number().int().positive().optional(),
 });
 
-// ── POST /chat/send  (non-streaming) ──
+/** Helper to extract the most recent user question */
+function extractQuestion(body: {
+  message?: string;
+  messages?: Array<{
+    role: "system" | "user" | "assistant";
+    content: string | Array<{ type: string; text?: string }>;
+  }>;
+}): string {
+  if (body.message && body.message.trim()) {
+    return body.message.trim();
+  }
+
+  if (body.messages && body.messages.length > 0) {
+    // Find the last user message
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+      const msg = body.messages[i];
+      if (msg.role === "user") {
+        if (typeof msg.content === "string") return msg.content.trim();
+        if (Array.isArray(msg.content)) {
+          const textPart = msg.content.find((p) => p.type === "text" && p.text);
+          if (textPart && textPart.text) return textPart.text.trim();
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
+/** Format chat.py sources for the frontend */
+function formatSources(sources?: any[]) {
+  if (!Array.isArray(sources)) return [];
+  return sources.map((s) => ({
+    kind: s.title && s.title.toLowerCase().includes("sop") ? "SOP BPS" : "Publikasi BPS",
+    title: s.title || "Dokumen BPS",
+    meta:
+      [
+        s.percent != null ? `Relevansi: ${s.percent}%` : null,
+        s.pages && s.pages.length > 0 ? `Hal. ${s.pages.join(", ")}` : null,
+      ]
+        .filter(Boolean)
+        .join(" • ") || "Publikasi Resmi BPS",
+    link: s.link || undefined,
+    rawScore: s.raw_score ?? null,
+    pages: s.pages ?? [],
+    citedPages: s.cited_pages ?? [],
+    images: s.images ?? [],
+  }));
+}
+
+// ── GET /chat/status (Check Python chat.py backend health) ──
+chatRoutes.get("/status", async (c) => {
+  try {
+    const res = await fetch(`${CHAT_PY_URL}/api/health`, { method: "GET" });
+    if (res.ok) {
+      const data = await res.json();
+      return c.json({ backend: "chat.py", connected: true, ...data });
+    }
+    return c.json({ backend: "chat.py", connected: false, status: res.status }, 503);
+  } catch (err) {
+    return c.json(
+      {
+        backend: "chat.py",
+        connected: false,
+        error: (err as Error).message,
+        hint: `Pastikan server python back-end/app.py aktif di ${CHAT_PY_URL}`,
+      },
+      503,
+    );
+  }
+});
+
+// ── POST /chat/send  (non-streaming via chat.py) ──
 chatRoutes.post(
   "/send",
   zValidator("json", sendMessageSchema),
   async (c) => {
     const body = c.req.valid("json");
     const conversationId = body.conversationId ?? crypto.randomUUID();
+    const question = extractQuestion(body);
 
-    // Build messages array: use provided history or create from single message
-    const messages = buildMessages(body);
-
-    const res = await fetch(`${AI_BASE}/chat/completions`, {
-      method: "POST",
-      headers: aiHeaders(),
-      body: JSON.stringify({
-        model: body.model ?? AI_MODEL,
-        messages,
-        temperature: body.temperature ?? 0.7,
-        max_tokens: body.max_tokens ?? 4096,
-        stream: false,
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      return c.json({ error: `AI API error: ${res.status}`, detail: err }, 502);
+    if (!question) {
+      return c.json({ error: "Pertanyaan tidak boleh kosong." }, 400);
     }
 
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-    };
+    try {
+      const res = await fetch(`${CHAT_PY_URL}/api/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, conversationId }),
+      });
 
-    const text = data.choices?.[0]?.message?.content ?? "";
+      if (!res.ok) {
+        const err = await res.text();
+        return c.json(
+          {
+            error: `Python chat.py backend error (${res.status})`,
+            detail: err,
+            hint: `Pastikan Ollama dan Qdrant berjalan serta server Python aktif di ${CHAT_PY_URL}.`,
+          },
+          502,
+        );
+      }
 
-    return c.json({
-      id: crypto.randomUUID(),
-      conversationId,
-      text,
-      usage: data.usage ?? null,
-      createdAt: new Date().toISOString(),
-    });
+      const data = (await res.json()) as {
+        answer?: string;
+        sources?: any[];
+        featured_image?: { url: string; page?: string; title?: string };
+        warning?: string;
+        note?: string;
+        mode?: string;
+        cached?: boolean;
+      };
+
+      const sources = formatSources(data.sources);
+
+      return c.json({
+        id: crypto.randomUUID(),
+        conversationId,
+        text: data.answer ?? "",
+        sources,
+        warning: data.warning ?? null,
+        note: data.note ?? null,
+        featuredImage: data.featured_image ?? null,
+        mode: data.mode ?? "qa",
+        cached: data.cached ?? false,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      console.error("[Chat Py Error]:", err);
+      return c.json(
+        {
+          error: "Gagal terhubung ke backend Python chat.py",
+          detail: err?.message,
+          hint: `Jalankan server Python dengan perintah 'python back-end/app.py' (port default 5000).`,
+        },
+        502,
+      );
+    }
   },
 );
 
-// ── POST /chat/stream  (SSE streaming) ──
+// ── POST /chat/stream  (SSE streaming via chat.py) ──
 chatRoutes.post(
   "/stream",
   zValidator("json", sendMessageSchema),
   async (c) => {
     const body = c.req.valid("json");
     const conversationId = body.conversationId ?? crypto.randomUUID();
-    const messages = buildMessages(body);
+    const question = extractQuestion(body);
 
-    const aiRes = await fetch(`${AI_BASE}/chat/completions`, {
-      method: "POST",
-      headers: aiHeaders(),
-      body: JSON.stringify({
-        model: body.model ?? AI_MODEL,
-        messages,
-        temperature: body.temperature ?? 0.7,
-        max_tokens: body.max_tokens ?? 4096,
-        stream: true,
-      }),
-    });
-
-    if (!aiRes.ok) {
-      const err = await aiRes.text();
-      return c.json({ error: `AI API error: ${aiRes.status}`, detail: err }, 502);
+    if (!question) {
+      return c.json({ error: "Pertanyaan tidak boleh kosong." }, 400);
     }
 
-    // Stream SSE from AI → client
-    const stream = new ReadableStream({
-      async start(controller) {
-        const reader = aiRes.body?.getReader();
-        if (!reader) {
+    try {
+      const pyRes = await fetch(`${CHAT_PY_URL}/api/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, conversationId }),
+      });
+
+      if (!pyRes.ok || !pyRes.body) {
+        const errText = await pyRes.text().catch(() => "Gagal membaca error dari server Python");
+        // Stream error message as SSE
+        const errStream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(`data: ${JSON.stringify({ conversationId })}\n\n`),
+            );
+            const errMsg = `Maaf, backend Python chat.py tidak dapat diakses (${pyRes.status}).\n\nDetail: ${errText}\n\nPastikan:
+1. Python backend 'python back-end/app.py' sudah aktif.
+2. Ollama dan Qdrant sudah berjalan.`;
+            controller.enqueue(
+              new TextEncoder().encode(
+                `data: ${JSON.stringify({ choices: [{ delta: { content: errMsg } }] })}\n\n`,
+              ),
+            );
+            controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+
+        return new Response(errStream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        });
+      }
+
+      // Stream SSE from Python chat.py → client
+      return new Response(pyRes.body, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
+    } catch (err: any) {
+      console.error("[Chat Stream Py Error]:", err);
+      const errMsg = `Tidak dapat terhubung ke backend Python chat.py di ${CHAT_PY_URL}.\n\nSilakan jalankan backend Python:\n\`\`\`powershell\npython back-end/app.py\n\`\`\`\nPastikan Ollama dan Qdrant juga telah aktif.`;
+
+      const errStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(`data: ${JSON.stringify({ conversationId })}\n\n`),
+          );
+          controller.enqueue(
+            new TextEncoder().encode(
+              `data: ${JSON.stringify({ choices: [{ delta: { content: errMsg } }] })}\n\n`,
+            ),
+          );
+          controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
           controller.close();
-          return;
-        }
-        const decoder = new TextDecoder();
-        // Send conversation ID as first event
-        controller.enqueue(
-          new TextEncoder().encode(`data: ${JSON.stringify({ conversationId })}\n\n`),
-        );
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-        } catch (err) {
-          controller.error(err);
-        } finally {
-          controller.close();
-        }
-      },
+        },
+      });
+
+      return new Response(errStream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
+    }
+  },
+);
+
+// ── POST /chat/upload  (file upload → text extraction + chat.py) ──
+chatRoutes.post("/upload", async (c) => {
+  const formData = await c.req.formData();
+  const file = formData.get("file") as File | null;
+  const message = (formData.get("message") as string) ?? "";
+  const conversationId = (formData.get("conversationId") as string) ?? crypto.randomUUID();
+
+  if (!file) {
+    return c.json({ error: "No file provided" }, 400);
+  }
+
+  let prompt = message;
+  const isImage = file.type.startsWith("image/");
+
+  if (isImage) {
+    prompt = message
+      ? `${message}\n(Gambar: ${file.name})`
+      : `Tolong analisis informasi pada gambar ${file.name}.`;
+  } else {
+    try {
+      const text = await file.text();
+      const filePreview = text.length > 8000 ? text.slice(0, 8000) + "\n... (dipotong)" : text;
+      prompt = message
+        ? `${message}\n\n---\nIsi dokumen "${file.name}":\n${filePreview}`
+        : `Tolong analisis isi dokumen "${file.name}" berikut:\n${filePreview}`;
+    } catch {
+      prompt = message ? `${message} (File: ${file.name})` : `Tolong analisis file ${file.name}.`;
+    }
+  }
+
+  try {
+    const pyRes = await fetch(`${CHAT_PY_URL}/api/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: prompt, conversationId }),
     });
 
-    return new Response(stream, {
+    if (!pyRes.ok || !pyRes.body) {
+      const errText = await pyRes.text().catch(() => "Gagal membaca error dari server Python");
+      const errStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(`data: ${JSON.stringify({ conversationId })}\n\n`),
+          );
+          controller.enqueue(
+            new TextEncoder().encode(
+              `data: ${JSON.stringify({
+                choices: [
+                  {
+                    delta: {
+                      content: `Gagal memproses file pada Python chat.py (${pyRes.status}): ${errText}`,
+                    },
+                  },
+                ],
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      });
+
+      return new Response(errStream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
+    }
+
+    return new Response(pyRes.body, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
       },
     });
-  },
-);
-
-// ── POST /chat/upload  (file/image → text extraction + chat) ──
-chatRoutes.post("/upload", async (c) => {
-  const formData = await c.req.formData();
-  const file = formData.get("file") as File | null;
-  const message = (formData.get("message") as string) ?? "";
-  const conversationId = (formData.get("conversationId") as string) ?? crypto.randomUUID();
-  const model = (formData.get("model") as string) ?? AI_MODEL;
-
-  if (!file) {
-    return c.json({ error: "No file provided" }, 400);
-  }
-
-  const isImage = file.type.startsWith("image/");
-  const contentParts: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> = [];
-
-  if (isImage) {
-    // Convert image to base64 data URL for vision models
-    const arrayBuf = await file.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuf)));
-    const dataUrl = `data:${file.type};base64,${base64}`;
-
-    if (message) {
-      contentParts.push({ type: "text", text: message });
-    }
-    contentParts.push({
-      type: "image_url",
-      image_url: { url: dataUrl, detail: "auto" },
+  } catch (err: any) {
+    const errMsg = `Gagal menghubungkan upload file ke backend Python: ${err?.message}`;
+    const errStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(`data: ${JSON.stringify({ conversationId })}\n\n`),
+        );
+        controller.enqueue(
+          new TextEncoder().encode(
+            `data: ${JSON.stringify({ choices: [{ delta: { content: errMsg } }] })}\n\n`,
+          ),
+        );
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      },
     });
-  } else {
-    // Text-based file: read content as text
-    const text = await file.text();
-    const filePreview = text.length > 8000 ? text.slice(0, 8000) + "\n... (dipotong)" : text;
-    const userMsg = message
-      ? `${message}\n\n---\nIsi file "${file.name}":\n${filePreview}`
-      : `Tolong analisis file "${file.name}" berikut:\n${filePreview}`;
-    contentParts.push({ type: "text", text: userMsg });
+
+    return new Response(errStream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
   }
-
-  const messages = [
-    {
-      role: "system" as const,
-      content:
-        "Anda adalah asisten AI BPS (Badan Pusat Statistik). Bantu pengguna menganalisis data, dokumen, atau pertanyaan terkait statistik Indonesia.",
-    },
-    { role: "user" as const, content: contentParts },
-  ];
-
-  const aiRes = await fetch(`${AI_BASE}/chat/completions`, {
-    method: "POST",
-    headers: aiHeaders(),
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.7,
-      max_tokens: 4096,
-      stream: true,
-    }),
-  });
-
-  if (!aiRes.ok) {
-    const err = await aiRes.text();
-    return c.json({ error: `AI API error: ${aiRes.status}`, detail: err }, 502);
-  }
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      const reader = aiRes.body?.getReader();
-      if (!reader) {
-        controller.close();
-        return;
-      }
-      controller.enqueue(
-        new TextEncoder().encode(`data: ${JSON.stringify({ conversationId })}\n\n`),
-      );
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
-        }
-      } catch (err) {
-        controller.error(err);
-      } finally {
-        controller.close();
-      }
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
-  });
 });
-
-// ── Helpers ──
-
-const SYSTEM_PROMPT = `Anda adalah asisten AI BPS (Badan Pusat Statistik).
-Bantu pengguna menganalisis data, menjawab pertanyaan statistik, dan memberikan insight dari data BPS Indonesia.
-Gunakan bahasa Indonesia. Jawaban harus akurat berdasarkan data yang tersedia.
-
-Anda DAPAT menggunakan format blok khusus untuk output kaya. Gunakan code fence dengan tipe yang sesuai:
-
-### Chart (grafik interaktif)
-\`\`\`chart:bar
-{"title":"Judul Chart","subtitle":"Subtitle","labels":["Jan","Feb","Mar","Apr"],"datasets":[{"label":"Seri 1","data":[100,150,120,180]}]}
-\`\`\`
-Tipe: chart:bar, chart:line, chart:area, chart:pie
-Format data: labels + datasets, ATAU array of objects: {"data":[{"name":"Jan","value":100}]}
-
-### Gambar
-\`\`\`image
-{"url":"https://example.com/gambar.jpg","alt":"Deskripsi gambar","caption":"Caption opsional"}
-\`\`\`
-Atau markdown: ![alt](url)
-
-### File/Dokumen
-\`\`\`file
-{"name":"Laporan.pdf","type":"pdf","size":"2.3 MB","url":"/path/to/file","description":"Deskripsi singkat"}
-\`\`\`
-
-### Embed Video
-\`\`\`embed:youtube
-{"url":"https://youtube.com/watch?v=IDVIDEO","title":"Judul Video"}
-\`\`\`
-
-### Tabel
-Gunakan markdown table biasa:
-| Kolom 1 | Kolom 2 |
-|---------|---------|
-| Data 1  | Data 2  |
-
-### Rumus Matematika
-Gunakan LaTeX:
-- Inline: $rumus$ contoh: $\\bar{x} = \\frac{1}{n}\\sum_{i=1}^{n} x_i$
-- Block (tengah): $$rumus$$ contoh: $$\\sigma = \\sqrt{\\frac{1}{N}\\sum_{i=1}^{N}(x_i - \\mu)^2}$$
-- Persamaan, statistik, notasi matematik: gunakan LaTeX
-
-### Tips:
-- Selalu sertakan chart khi menampilkan data numerik (pertumbuhan, tren, perbandingan)
-- Gunakan chart:line untuk tren waktu, chart:bar untuk perbandingan, chart:pie untuk proporsi
-- Sertakan file/dokumen referensi khi ada
-- Gunakan markdown **bold**, *italic*, heading, dan list untuk teks
-- Jawaban harus informatif, terstruktur, dan mudah dipahami
-
-### Saran Pertanyaan Lanjutan
-Di AKHIR setiap jawaban, tambahkan 3 pertanyaan lanjutan yang relevan untuk membantu pengguna menjelajahi lebih dalam.
-Format: baris terpisah, diawali tanda `- `, minimal 3 saran.
-Contoh:
-- Tampilkan tren pertumbuhan ekonomi dalam chart
-- Bandingkan dengan provinsi lain
-- Buatkan ringkasan eksekutif data ini`;
-
-function buildMessages(body: {
-  message?: string;
-  messages?: { role: "system" | "user" | "assistant"; content: string | Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> }[];
-}): { role: string; content: string | Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> }[] {
-  if (body.messages && body.messages.length > 0) {
-    // Ensure system prompt is first
-    const hasSystem = body.messages[0]?.role === "system";
-    return hasSystem ? body.messages : [{ role: "system", content: SYSTEM_PROMPT }, ...body.messages];
-  }
-  // Single message mode
-  return [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: body.message ?? "" },
-  ];
-}
 
 export { chatRoutes };

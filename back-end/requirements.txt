@@ -1,0 +1,9 @@
+flask>=3.0.0
+flask-cors>=4.0.0
+qdrant-client>=1.7.0
+llama-index-core>=0.10.0
+llama-index-llms-ollama>=0.1.0
+llama-index-embeddings-ollama>=0.1.0
+llama-index-vector-stores-qdrant>=0.1.0
+sentence-transformers>=2.2.0
+torch

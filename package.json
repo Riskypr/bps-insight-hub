@@ -9,7 +9,14 @@
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "postinstall": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio",
+    "db:setup-trgm": "npx tsx api/scripts/setup-trgm.ts",
+    "py:server": "python back-end/app.py",
+    "py:install": "pip install -r back-end/requirements.txt"
   },
   "overrides": {
     "rolldown": "1.2.1"

@@ -47,19 +47,46 @@ export type ApiMessage = {
   content: string | ApiContentPart[];
 };
 
+export type ChatSourceItem = {
+  kind: string;
+  title: string;
+  meta: string;
+  link?: string;
+  rawScore?: number | null;
+  pages?: string[];
+  citedPages?: string[];
+  images?: Array<{ page: string; url: string; text_reliable?: boolean }>;
+};
+
 export type ChatSendResult = {
   id: string;
   conversationId: string;
   text: string;
-  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
+  sources?: ChatSourceItem[];
+  warning?: string | null;
+  note?: string | null;
+  featuredImage?: { url: string; page?: string; title?: string } | null;
+  mode?: string;
+  cached?: boolean;
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
   createdAt: string;
 };
 
 // ── Non-streaming request ──
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  // Merge caller-supplied headers (which may override Content-Type)
+  if (init?.headers) {
+    const incoming = init.headers instanceof Headers
+      ? Object.fromEntries(init.headers.entries())
+      : Array.isArray(init.headers)
+        ? Object.fromEntries(init.headers)
+        : init.headers;
+    Object.assign(headers, incoming);
+  }
   const res = await fetch(`${BASE}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -92,7 +119,7 @@ export const api = {
     /** Non-streaming: send message, get full response */
     send: (
       message: string,
-      opts?: { conversationId?: string; messages?: ApiMessage[]; model?: string },
+      opts?: { conversationId?: string | undefined; messages?: ApiMessage[] | undefined; model?: string | undefined },
     ) =>
       request<ChatSendResult>("/chat/send", {
         method: "POST",
@@ -102,14 +129,14 @@ export const api = {
     /** Streaming: returns SSE stream. Parse with `parseSSEStream`. */
     stream: (
       message: string,
-      opts?: { conversationId?: string; messages?: ApiMessage[]; model?: string },
+      opts?: { conversationId?: string | undefined; messages?: ApiMessage[] | undefined; model?: string | undefined },
     ) =>
       streamRequest("/chat/stream", { message, ...opts }),
 
     /** Upload file/image + optional message → streaming response */
     upload: async (
       file: File,
-      opts?: { message?: string; conversationId?: string; model?: string },
+      opts?: { message?: string | undefined; conversationId?: string | undefined; model?: string | undefined },
     ) => {
       const form = new FormData();
       form.append("file", file);
@@ -215,9 +242,17 @@ export async function* parseSSEStream(
         if (data === "[DONE]") return;
         try {
           const parsed = JSON.parse(data);
-          // If it's a chunk with conversationId (first event)
-          if (parsed.conversationId) {
-            yield { type: "meta" as const, conversationId: parsed.conversationId };
+          // If it's a chunk with conversationId or rich metadata (meta event)
+          if (parsed.conversationId || parsed.sources || parsed.warning || parsed.featuredImage) {
+            yield {
+              type: "meta" as const,
+              conversationId: parsed.conversationId,
+              sources: parsed.sources as ChatSourceItem[] | undefined,
+              warning: parsed.warning as string | null | undefined,
+              note: parsed.note as string | null | undefined,
+              featuredImage: parsed.featuredImage as { url: string; page?: string; title?: string } | null | undefined,
+              mode: parsed.mode as string | undefined,
+            };
           }
           // OpenAI-style chunk
           else if (parsed.choices) {
