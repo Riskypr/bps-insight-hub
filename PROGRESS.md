@@ -13,10 +13,10 @@ Dokumen ini mencatat pelacakan status migrasi model AI dari **AI Chat Completion
 | **Layer Caching Respon (`answer_cache.py`)** | ✅ Selesai | Dual-layer cache (Exact match + Semantic similarity) |
 | **Frontend Hook & UI (`use-chat.tsx`, dsb.)** | ✅ Selesai | Konsumsi SSE streaming & rendering sumber data BPS |
 | **Instalasi Dependensi Python** | ✅ Selesai | Pemasangan seluruh pustaka dari `requirements.txt` sukses |
-| **Verifikasi Server & Build Frontend** | ✅ Selesai | `app.py` berhasil di-load & `npm run build` sukses 100% |
-| **Verifikasi Service Eksternal (Ollama & Qdrant)** | ⏳ Belum Dilakukan | Memerlukan Ollama (`qwen2.5:3b-instruct`) dan Qdrant (`localhost:6333`) aktif |
-| **Pengujian End-to-End Interaktif** | ⏳ Belum Dilakukan | Uji aliran query dari UI browser hingga inferensi RAG lokal |
-| **Git Commit & Penyimpanan** | ⏳ Belum Dilakukan | Commit perubahan yang belum distage |
+| **Verifikasi Server & Build Frontend** | ✅ Selesai | `app.py` aktif (port 5000) & Vite frontend aktif (port 8081) |
+| **Uji Komunikasi Proxy End-to-End** | ✅ Selesai | Rute `/api/chat/status` & `/api/chat/send` terverifikasi |
+| **Git Commit & Penyimpanan** | ✅ Selesai | Tersimpan di commit `2479cf5` tanpa rewrite history |
+| **Aktivasi Service Eksternal (Ollama & Qdrant)** | ⏳ Menunggu User | Jalankan Ollama & Qdrant di mesin lokal untuk inferensi penuh |
 
 ---
 
@@ -26,66 +26,68 @@ Dokumen ini mencatat pelacakan status migrasi model AI dari **AI Chat Completion
    - Memetakan dan menginisialisasi pipeline LlamaIndex dari `chat.py` (`build_index()`, `build_or_load_title_index()`, dan `answer_question()`).
    - Menyediakan endpoint:
      - `GET /api/health` — Status kesiapan model & koneksi Qdrant/Ollama.
+     - `GET/POST /api/init` — Trigger re-koneksi pipeline tanpa restart Flask server.
      - `POST /api/ask` — Inferensi tanya-jawab mode non-streaming dengan cache.
-     - `POST /api/chat/stream` — Inferensi streaming menggunakan Server-Sent Events (SSE), memecah token jawaban dan menyertakan metadata sumber dokumen BPS di akhir aliran.
-   - Penanganan serving file dokumen publikasi via direktori statik.
+     - `POST /api/chat/stream` — Inferensi streaming SSE dengan token teks & metadata dokumen BPS.
+   - Penanganan graceful fallback jika Ollama/Qdrant belum siap sehingga server Flask tetap hidup melayani status.
 
 2. **Dukungan Caching Cerdas (`back-end/answer_cache.py`)**:
    - Implementasi cache dua lapis (Exact MD5 match + Semantic cosine similarity embedding).
-   - Pengurangan beban inferensi LLM untuk pertanyaan yang sering diajukan.
 
 3. **Refactor API Proxy (`api/routes/chat.ts`)**:
-   - Mengganti pemanggilan langsung ke API eksternal (`http://localhost:20128/v1/chat/completions`) dengan proxy pintar ke server Flask Python (`http://localhost:5000`).
-   - Menyambungkan streaming SSE tanpa buffering ke klien.
-   - Transformasi struktur metadata sumber (`formatSources`) agar sesuai dengan komponen kartu referensi BPS di frontend.
+   - Mengganti pemanggilan API pihak ketiga eksternal dengan proxy ke server Flask lokal (`http://localhost:5000`).
+   - Meneruskan streaming SSE tanpa buffering ke klien.
+   - Memetakan format sumber kutipan BPS (`formatSources`) ke kartu UI frontend.
 
 4. **Refactor Klien & Hook Frontend**:
-   - `src/lib/api.ts`: Implementasi fungsi `api.chat.stream()`, `api.chat.send()`, `api.chat.upload()`, serta generator async `parseSSEStream()` untuk parsing event SSE (tipe `token` dan `meta`).
-   - `src/hooks/use-chat.tsx`: Mengganti mock engine dengan streaming data riil dari backend, mengelola status koneksi, pembentukan pesan bertahap, dan penangkapan metadata referensi.
-   - `src/components/chat/chat-workspace.tsx` & `src/components/common.tsx`: Pembaruan rendering kartu dokumen sumber (`SourceCard`) agar memuat tautan unduh/baca publikasi asli.
+   - `src/lib/api.ts`: Generator async `parseSSEStream()` untuk streaming data & event metadata.
+   - `src/hooks/use-chat.tsx`: Integrasi streaming, loading state, dan error toast informatif.
+   - `src/components/chat/chat-workspace.tsx` & `src/components/common.tsx`: Tampilan referensi sumber dokumen BPS dengan tombol buka tautan.
 
 5. **Konfigurasi & Skrip Proyek**:
-   - Menambahkan variabel `CHAT_PY_URL=http://localhost:5000` pada `.env` dan `.env.example`.
-   - Menambahkan skrip pemicu di `package.json`:
-     - `"py:server": "python back-end/app.py"`
-     - `"py:install": "pip install -r back-end/requirements.txt"`
-   - Pembaruan konfigurasi `vite.config.ts` untuk mendukung routing API lokal dan folder data statik backend.
+   - Variabel `CHAT_PY_URL=http://localhost:5000` di `.env` dan `.env.example`.
+   - Script `npm run py:server` dan `npm run py:install` di `package.json`.
+   - Konfigurasi `vite.config.ts` untuk proxy API dan statik file.
+   - Pembaruan `.gitignore` untuk direktori cache Python (`__pycache__`, `venv`).
 
-6. **Instalasi Pustaka Python**:
-   - Berhasil memasang seluruh dependensi dari `back-end/requirements.txt` (`llama-index-core`, `llama-index-llms-ollama`, `llama-index-embeddings-ollama`, `llama-index-vector-stores-qdrant`, `qdrant-client`, `sentence-transformers`, `torch`, `flask`, `flask-cors`, dll).
+6. **Pemasangan Dependensi & Verifikasi Lingkungan**:
+   - Seluruh paket Python di `requirements.txt` sukses terpasang.
+   - Verifikasi import modul Python sukses.
+   - Build produksi Vite (`npm run build`) sukses 100%.
 
-7. **Verifikasi Sintaks & Build Production**:
-   - Server adapter `back-end/app.py` berhasil diverifikasi dan dimuat tanpa error (`app.py successfully loaded!`).
-   - Build bundle produksi frontend TanStack Start/Vite (`npm run build`) berhasil 100% tanpa error.
+7. **Uji Coba Komunikasi Antar-Layanan**:
+   - Server Flask Python berjalan di latar belakang pada `http://localhost:5000`.
+   - Server Vite Dev berjalan di latar belakang pada `http://localhost:8081`.
+   - Panggilan dari frontend ke `/api/chat/status` berhasil diteruskan ke Flask dan mengembalikan status konektivitas terverifikasi (`backend: chat.py`, `connected: True`).
+   - Panggilan `/api/chat/send` berhasil menerima payload JSON dan memberikan respon error handling informatif saat Ollama offline.
+
+8. **Penyimpanan ke Git**:
+   - Seluruh perubahan telah di-commit ke Git pada commit `2479cf5`:
+     `feat(ai): integrate local Python chat.py RAG engine to replace external LLM API` (sesuai aturan Lovable, tanpa rewrite git history).
 
 ---
 
-## 🟡 Progress yang Sedang Berjalan (In Progress)
+## ⏳ Langkah yang Perlu Dijalankan Pengguna (Next Steps / Cara Menjalankan)
 
-1. **Persiapan Pengujian Komunikasi Antar-Layanan**:
-   - Menyiapkan instruksi menjalankan server backend Python (`npm run py:server`) berdampingan dengan server frontend (`npm run dev`).
+Karena model AI RAG menggunakan LLM lokal dan vector store pada mesin Anda, jalankan dua service pendukung berikut:
 
----
-
-## ⏳ Progress yang Belum Dilakukan (To Do / Next Steps)
-
-1. **Pengecekan dan Persiapan Service Penunjang**:
-   - **Ollama**:
-     - Memastikan service Ollama berjalan di `http://localhost:11434`.
-     - Model LLM: `ollama pull qwen2.5:3b-instruct` (atau model yang diatur pada `chat.py`).
-     - Model Embedding: `ollama pull bge-m3` (atau model embedding yang digunakan).
-   - **Qdrant**:
-     - Memastikan service Qdrant aktif di `localhost:6333` dan index vektor dokumen BPS sudah tersedia atau siap di-generate.
-
-2. **Uji Coba Fungsionalitas End-to-End Interaktif**:
-   - Menjalankan Flask backend: `npm run py:server` (atau `python back-end/app.py`).
-   - Menjalankan aplikasi web frontend: `npm run dev`.
-   - Melakukan pengujian percakapan interaktif di browser:
-     - Streaming respons teks kata demi kata.
-     - Penampilan kartu referensi sumber publikasi BPS (halaman, judul dokumen, persentase relevansi).
-     - Validasi cache pada pertanyaan berulang.
-
-3. **Penyimpanan Perubahan ke Git**:
-   - Memeriksa `git status` dan melakukan commit semua berkas yang telah dimodifikasi dan ditambahkan dengan pesan commit yang bersih dan jelas, mematuhi panduan Lovable (tanpa rewrite git history).
+1. **Nyalakan Ollama**:
+   - Pastikan Ollama terpasang dan berjalan di `http://localhost:11434`.
+   - Download model yang dikonfigurasi:
+     ```bash
+     ollama run qwen2.5:3b-instruct
+     ollama pull nomic-embed-text
+     ```
+2. **Nyalakan Qdrant**:
+   - Jalankan Qdrant di port `6333` (misal via Docker):
+     ```bash
+     docker run -p 6333:6333 -p 6334:6334 -v qdrant_storage:/qdrant/storage qdrant/qdrant
+     ```
+3. **Inisialisasi Ulang Pipeline**:
+   - Setelah Ollama & Qdrant aktif, Anda dapat memicu re-koneksi tanpa restart server dengan memanggil:
+     ```bash
+     curl -X POST http://localhost:5000/api/init
+     ```
+   - Buka browser di **`http://localhost:8081/chat`** untuk langsung berinteraksi dengan AI BPS Insight Hub.
 
 
