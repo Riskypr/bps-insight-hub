@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { prisma } from "../lib/prisma";
 import { pdfStorage } from "../lib/pdf-storage";
+import { RagUnavailableError, ragEnabled, ragFetch, ragIngest } from "../lib/rag";
 
 const MAX_FILES = 20;
 const MAX_FILE_SIZE = Number(process.env.PDF_MAX_FILE_SIZE_BYTES ?? 25 * 1024 * 1024);
@@ -94,6 +95,27 @@ pdfRoutes.post("/upload", async (c) => {
       continue;
     }
 
+    // Teruskan ke chatbot (RAG) dengan NAMA ASLI; nama file = kunci dokumen di Qdrant.
+    const rag = ragEnabled()
+      ? await ragIngest({
+          name: file.name,
+          content,
+          title: metadata[index]?.title?.trim() || undefined,
+          uploader: c.req.header("x-user-id") ?? undefined,
+          replace: formData.get("replace") === "true",
+        })
+      : null;
+    if (rag && !rag.storeLocally) {
+      const item: Record<string, unknown> = {
+        originalName: file.name,
+        status: rag.hubStatus,
+        ...rag.fields,
+      };
+      if (rag.reason !== undefined) item["reason"] = rag.reason;
+      results.push(item);
+      continue;
+    }
+
     const fileHash = createHash("sha256").update(content).digest("hex");
     const existing = await prisma.pdfFile.findUnique({ where: { fileHash } });
     if (existing) {
@@ -120,7 +142,13 @@ pdfRoutes.post("/upload", async (c) => {
           uploadedBy: c.req.header("x-user-id") ?? null,
         },
       });
-      results.push({ originalName: file.name, status: "SUCCESS", id: record.id, fileUrl: record.fileUrl });
+      results.push({
+        originalName: file.name,
+        status: "SUCCESS",
+        id: record.id,
+        fileUrl: record.fileUrl,
+        ...(rag?.fields ?? {}),
+      });
     } catch (error: unknown) {
       await pdfStorage.remove(storageKey);
       const duplicate = (error as { code?: string }).code === "P2002";
@@ -139,6 +167,25 @@ pdfRoutes.post("/upload", async (c) => {
   const failed = results.length - uploaded - skipped;
   cacheClear(); // invalidate list cache after upload
   return c.json({ success: failed === 0, message: "Upload process completed", summary: { total: files.length, uploaded, skipped, failed }, data: results }, failed ? 207 : 200);
+});
+
+// Status ingest di chatbot (dipoll frontend tiap 3-5 detik sampai INDEXED/FAILED/SKIPPED)
+pdfRoutes.get("/rag-jobs/:jobId", async (c) => {
+  const jobId = c.req.param("jobId");
+  // Jangan teruskan apa pun di luar format job_id (mencegah path traversal ke RAG).
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(jobId)) return c.json({ error: "job id tidak valid" }, 400);
+  try {
+    const res = await ragFetch(`/api/ingest/${jobId}`);
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 404) return c.json({ error: "Job tidak ditemukan" }, 404);
+    if (!res.ok) return c.json({ error: "Layanan RAG bermasalah" }, 502);
+    return c.json(body);
+  } catch (e) {
+    if (e instanceof RagUnavailableError) {
+      return c.json({ error: "Layanan RAG tidak terjangkau" }, 502);
+    }
+    throw e;
+  }
 });
 
 pdfRoutes.post("/check-duplicate", async (c) => {

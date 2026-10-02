@@ -5,6 +5,7 @@ import { chatRoutes } from "./routes/chat";
 import { conversationRoutes } from "./routes/conversations";
 import { datasetRoutes } from "./routes/datasets";
 import { pdfRoutes } from "./routes/pdfs";
+import { ragRoutes } from "./routes/rag";
 
 const app = new Hono();
 
@@ -34,5 +35,6 @@ app.route("/chat", chatRoutes);
 app.route("/datasets", datasetRoutes);
 app.route("/conversations", conversationRoutes);
 app.route("/v1/pdfs", pdfRoutes);
+app.route("/rag", ragRoutes);
 
 export default app;

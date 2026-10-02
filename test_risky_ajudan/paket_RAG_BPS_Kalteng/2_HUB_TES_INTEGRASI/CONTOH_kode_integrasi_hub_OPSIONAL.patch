@@ -1,0 +1,328 @@
+diff --git a/api/index.ts b/api/index.ts
+index 12f8f2e..596d462 100644
+--- a/api/index.ts
++++ b/api/index.ts
+@@ -5,6 +5,7 @@ import { chatRoutes } from "./routes/chat";
+ import { conversationRoutes } from "./routes/conversations";
+ import { datasetRoutes } from "./routes/datasets";
+ import { pdfRoutes } from "./routes/pdfs";
++import { ragRoutes } from "./routes/rag";
+ 
+ const app = new Hono();
+ 
+@@ -33,5 +34,6 @@ app.route("/chat", chatRoutes);
+ app.route("/datasets", datasetRoutes);
+ app.route("/conversations", conversationRoutes);
+ app.route("/v1/pdfs", pdfRoutes);
++app.route("/rag", ragRoutes);
+ 
+ export default app;
+diff --git a/pb/api/lib/rag.ts b/api/lib/rag.ts
+new file mode 100644
+index 0000000..cf53f21
+--- /dev/null
++++ b/api/lib/rag.ts
+@@ -0,0 +1,133 @@
++// Klien untuk layanan RAG BPS Kalteng (Flask). Kontrak: KONTRAK_API_RAG.md
++// Semua konfigurasi dibaca dari env saat dipanggil (bukan saat modul dimuat).
++
++const cfg = () => ({
++  base: (process.env.RAG_API_BASE ?? "").replace(/\/+$/, ""),
++  key: process.env.RAG_API_KEY ?? "",
++  timeout: Number(process.env.RAG_TIMEOUT_MS ?? 180_000),
++});
++
++export const ragEnabled = () => Boolean(cfg().base);
++
++export class RagBusyError extends Error {
++  constructor(public retryAfter: number) { super("rag_sibuk"); }
++}
++export class RagAuthError extends Error { constructor() { super("rag_auth"); } }
++export class RagUnavailableError extends Error {}
++
++/** fetch ke RAG dengan key + batas waktu. Galat jaringan/timeout -> RagUnavailableError. */
++export async function ragFetch(path: string, init: RequestInit = {}, withKey = true): Promise<Response> {
++  const { base, key, timeout } = cfg();
++  const headers = new Headers(init.headers);
++  if (withKey && key) headers.set("Authorization", `Bearer ${key}`);
++  try {
++    return await fetch(`${base}${path}`, { ...init, headers, signal: AbortSignal.timeout(timeout) });
++  } catch (e) {
++    throw new RagUnavailableError(e instanceof Error ? e.message : String(e));
++  }
++}
++
++export type RagAnswer = {
++  mode: string; answer: string; warning?: string | null; note?: string | null;
++  sources?: { title?: string; pages?: string[]; cited_pages?: string[] }[];
++  featured_image?: { url: string; page?: string; title?: string } | null;
++};
++
++export async function ragAsk(question: string): Promise<RagAnswer> {
++  const res = await ragFetch("/api/ask", {
++    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question }),
++  });
++  if (res.status === 503) {
++    const j = (await res.json().catch(() => ({}))) as { error?: string; retry_after?: number };
++    if (j.error === "server_sibuk") throw new RagBusyError(Number(j.retry_after) || 30);
++    throw new RagUnavailableError("RAG belum siap");
++  }
++  if (res.status === 401) throw new RagAuthError();
++  if (!res.ok) throw new RagUnavailableError(`RAG ${res.status}`);
++  return (await res.json()) as RagAnswer;
++}
++
++/** Pertanyaan = teks pesan pengguna TERAKHIR (RAG belum punya riwayat percakapan). */
++export function extractQuestion(body: {
++  message?: string;
++  messages?: { role: string; content: string | { type: string; text?: string }[] }[];
++}): string {
++  if (body.messages?.length) {
++    const last = [...body.messages].reverse().find((m) => m.role === "user");
++    if (last) {
++      if (typeof last.content === "string") return last.content.trim();
++      return last.content.filter((p) => p.type === "text").map((p) => p.text ?? "").join("\n").trim();
++    }
++  }
++  return (body.message ?? "").trim();
++}
++
++const IMAGE_PREFIX = () => `${process.env.PUBLIC_API_PREFIX ?? "/api"}/rag/sop-image/`;
++
++/** Ubah jawaban RAG menjadi markdown untuk chat. Bullet '- ' diganti '* ' (lihat extractSuggestions). */
++export function formatRagAnswer(r: RagAnswer): string {
++  const parts: string[] = [];
++  parts.push(r.answer.replace(/^(\s*)-\s/gm, "$1* "));
++  if (r.warning) parts.push(`**Peringatan:** ${r.warning}`);
++  if (r.note) parts.push(`*${r.note}*`);
++  if (r.featured_image?.url) {
++    const name = r.featured_image.url.split("/").pop() ?? "";
++    const block = { url: `${IMAGE_PREFIX()}${name}`, alt: r.featured_image.title ?? "Halaman SOP",
++      caption: `${r.featured_image.title ?? "SOP"}${r.featured_image.page ? `, halaman ${r.featured_image.page}` : ""}` };
++    parts.push("```image\n" + JSON.stringify(block) + "\n```");
++  }
++  const titles = (r.sources ?? []).filter((s) => s.title);
++  if (titles.length) {
++    parts.push("**Sumber:**\n" + titles.map((s) => `* ${s.title}${s.pages?.length ? ` (hlm ${s.pages.join(", ")})` : ""}`).join("\n"));
++  }
++  return parts.join("\n\n");
++}
++
++/** Jawaban RAG (utuh) dikirim sebagai SSE format OpenAI supaya parser frontend tidak berubah. */
++export function ragSseResponse(text: string, conversationId: string): Response {
++  const enc = new TextEncoder();
++  const stream = new ReadableStream({
++    start(controller) {
++      controller.enqueue(enc.encode(`data: ${JSON.stringify({ conversationId })}\n\n`));
++      for (let i = 0; i < text.length; i += 60) {
++        controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: text.slice(i, i + 60) } }] })}\n\n`));
++      }
++      controller.enqueue(enc.encode("data: [DONE]\n\n"));
++      controller.close();
++    },
++  });
++  return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
++}
++
++export type IngestOutcome = {
++  hubStatus: "SUCCESS" | "SKIPPED" | "FAILED";
++  storeLocally: boolean;
++  reason?: string;
++  fields: { ragJobId?: string; ragStatus: string; existingChunks?: number };
++};
++
++/** Teruskan 1 PDF ke /api/ingest (nama asli dipertahankan) dan terjemahkan hasilnya untuk Hub. */
++export async function ragIngest(o: { name: string; content: Uint8Array; title?: string; uploader?: string; replace?: boolean }): Promise<IngestOutcome> {
++  const fd = new FormData();
++  fd.append("file", new File([o.content], o.name, { type: "application/pdf" }));
++  if (o.title) fd.append("title", o.title);
++  if (o.uploader) fd.append("uploader", o.uploader);
++  if (o.replace) fd.append("replace", "true");
++  let res: Response;
++  try {
++    res = await ragFetch("/api/ingest", { method: "POST", body: fd });
++  } catch {
++    return { hubStatus: "SUCCESS", storeLocally: true, fields: { ragStatus: "UNAVAILABLE" } };
++  }
++  const j = (await res.json().catch(() => ({}))) as Record<string, any>;
++  if (res.status === 202) return { hubStatus: "SUCCESS", storeLocally: true, fields: { ragJobId: j.job_id, ragStatus: j.status ?? "PENDING" } };
++  if (res.status === 200 && j.status === "SKIPPED")
++    return { hubStatus: "SKIPPED", storeLocally: false, reason: j.catatan || "Dilewati: bukan publikasi/SOP BPS Kalteng", fields: { ragJobId: j.job_id, ragStatus: "SKIPPED" } };
++  if (res.status === 409 && j.existing_job_id)
++    return { hubStatus: "SKIPPED", storeLocally: false, reason: "Dokumen identik sudah ada di chatbot", fields: { ragJobId: j.existing_job_id, ragStatus: "DUPLICATE" } };
++  if (res.status === 409)
++    return { hubStatus: "FAILED", storeLocally: false, reason: "Nama file sudah ada di chatbot; kirim ulang dengan replace untuk mengganti versi", fields: { ragStatus: "NAME_CONFLICT", existingChunks: j.existing_chunks } };
++  if (res.status === 401) return { hubStatus: "FAILED", storeLocally: false, reason: "Key layanan RAG ditolak", fields: { ragStatus: "AUTH_ERROR" } };
++  if (res.status >= 400 && res.status < 500) return { hubStatus: "FAILED", storeLocally: false, reason: j.error ?? "Ditolak layanan RAG", fields: { ragStatus: "REJECTED" } };
++  return { hubStatus: "SUCCESS", storeLocally: true, fields: { ragStatus: "UNAVAILABLE" } };
++}
+diff --git a/api/routes/chat.ts b/api/routes/chat.ts
+index bd1e77c..2ee07a6 100644
+--- a/api/routes/chat.ts
++++ b/api/routes/chat.ts
+@@ -1,6 +1,8 @@
+ import { zValidator } from "@hono/zod-validator";
+ import { Hono } from "hono";
++import type { Context } from "hono";
+ import { z } from "zod";
++import { RagAuthError, RagBusyError, extractQuestion, formatRagAnswer, ragAsk, ragEnabled, ragSseResponse } from "../lib/rag";
+ 
+ // ── Env config ──
+ const AI_BASE = process.env.AI_API_BASE ?? "http://localhost:20128/v1";
+@@ -15,6 +17,18 @@ function aiHeaders(): Record<string, string> {
+ 
+ const chatRoutes = new Hono();
+ 
++/** Galat RAG yang TIDAK boleh fallback (antre / key salah) -> Response; selain itu null (lanjut fallback). */
++function ragErrorResponse(c: Context, e: unknown): Response | null {
++  if (e instanceof RagBusyError) {
++    return c.json(
++      { error: "rag_sibuk", retry_after: e.retryAfter, message: `Server sedang antre, coba lagi sekitar ${e.retryAfter} detik.` },
++      503, { "Retry-After": String(e.retryAfter) });
++  }
++  if (e instanceof RagAuthError) return c.json({ error: "rag_auth", message: "Key layanan RAG ditolak. Hubungi admin." }, 502);
++  console.error("RAG gagal, memakai fallback:", e);
++  return null;
++}
++
+ // ── Schemas ──
+ const textContentSchema = z.object({ type: z.literal("text"), text: z.string() });
+ const imageContentSchema = z.object({
+@@ -47,6 +61,18 @@ chatRoutes.post(
+     const body = c.req.valid("json");
+     const conversationId = body.conversationId ?? crypto.randomUUID();
+ 
++    if (ragEnabled()) {
++      const question = extractQuestion(body);
++      if (!question) return c.json({ error: "Pertanyaan tidak boleh kosong" }, 400);
++      try {
++        const r = await ragAsk(question);
++        return c.json({ id: crypto.randomUUID(), conversationId, text: formatRagAnswer(r), usage: null, via: "rag", createdAt: new Date().toISOString() });
++      } catch (e) {
++        const early = ragErrorResponse(c, e);
++        if (early) return early;
++      }
++    }
++
+     // Build messages array: use provided history or create from single message
+     const messages = buildMessages(body);
+ 
+@@ -79,6 +105,7 @@ chatRoutes.post(
+       conversationId,
+       text,
+       usage: data.usage ?? null,
++      via: "fallback",
+       createdAt: new Date().toISOString(),
+     });
+   },
+@@ -91,6 +118,17 @@ chatRoutes.post(
+   async (c) => {
+     const body = c.req.valid("json");
+     const conversationId = body.conversationId ?? crypto.randomUUID();
++    if (ragEnabled()) {
++      const question = extractQuestion(body);
++      if (!question) return c.json({ error: "Pertanyaan tidak boleh kosong" }, 400);
++      try {
++        const r = await ragAsk(question);
++        return ragSseResponse(formatRagAnswer(r), conversationId);
++      } catch (e) {
++        const early = ragErrorResponse(c, e);
++        if (early) return early;
++      }
++    }
+     const messages = buildMessages(body);
+ 
+     const aiRes = await fetch(`${AI_BASE}/chat/completions`, {
+diff --git a/api/routes/pdfs.ts b/api/routes/pdfs.ts
+index fb3a1b9..bf886a7 100644
+--- a/api/routes/pdfs.ts
++++ b/api/routes/pdfs.ts
+@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
+ import { Hono } from "hono";
+ import { prisma } from "../lib/prisma";
+ import { pdfStorage } from "../lib/pdf-storage";
++import { ragEnabled, ragFetch, ragIngest, RagUnavailableError } from "../lib/rag";
+ 
+ const MAX_FILES = 20;
+ const MAX_FILE_SIZE = Number(process.env.PDF_MAX_FILE_SIZE_BYTES ?? 25 * 1024 * 1024);
+@@ -101,6 +102,16 @@ pdfRoutes.post("/upload", async (c) => {
+       continue;
+     }
+ 
++    // Teruskan ke chatbot (RAG) dengan NAMA ASLI; nama file = kunci dokumen di Qdrant.
++    const rag = ragEnabled()
++      ? await ragIngest({ name: file.name, content, title: metadata[index]?.title?.trim() || undefined,
++          uploader: c.req.header("x-user-id") ?? undefined, replace: formData.get("replace") === "true" })
++      : null;
++    if (rag && !rag.storeLocally) {
++      results.push({ originalName: file.name, status: rag.hubStatus, reason: rag.reason, ...rag.fields });
++      continue;
++    }
++
+     const id = crypto.randomUUID();
+     const storageKey = `${id}.pdf`;
+     try {
+@@ -120,7 +131,7 @@ pdfRoutes.post("/upload", async (c) => {
+           uploadedBy: c.req.header("x-user-id") ?? null,
+         },
+       });
+-      results.push({ originalName: file.name, status: "SUCCESS", id: record.id, fileUrl: record.fileUrl });
++      results.push({ originalName: file.name, status: "SUCCESS", id: record.id, fileUrl: record.fileUrl, ...(rag?.fields ?? {}) });
+     } catch (error: unknown) {
+       await pdfStorage.remove(storageKey);
+       const duplicate = (error as { code?: string }).code === "P2002";
+@@ -141,6 +152,22 @@ pdfRoutes.post("/upload", async (c) => {
+   return c.json({ success: failed === 0, message: "Upload process completed", summary: { total: files.length, uploaded, skipped, failed }, data: results }, failed ? 207 : 200);
+ });
+ 
++// Status ingest di chatbot (dipoll frontend tiap 3-5 detik sampai INDEXED/FAILED)
++pdfRoutes.get("/rag-jobs/:jobId", async (c) => {
++  const jobId = c.req.param("jobId");
++  if (!/^[A-Za-z0-9_-]{1,64}$/.test(jobId)) return c.json({ error: "job id tidak valid" }, 400);
++  try {
++    const res = await ragFetch(`/api/ingest/${jobId}`);
++    const body = await res.json().catch(() => ({}));
++    if (res.status === 404) return c.json({ error: "Job tidak ditemukan" }, 404);
++    if (!res.ok) return c.json({ error: "Layanan RAG bermasalah" }, 502);
++    return c.json(body);
++  } catch (e) {
++    if (e instanceof RagUnavailableError) return c.json({ error: "Layanan RAG tidak terjangkau" }, 502);
++    throw e;
++  }
++});
++
+ pdfRoutes.post("/check-duplicate", async (c) => {
+   const body = await c.req.json<{ hashes?: unknown }>().catch(() => ({}));
+   if (!Array.isArray(body.hashes) || body.hashes.some((hash) => typeof hash !== "string" || !/^[a-f0-9]{64}$/i.test(hash))) {
+diff --git a/pb/api/routes/rag.ts b/api/routes/rag.ts
+new file mode 100644
+index 0000000..af71ea2
+--- /dev/null
++++ b/api/routes/rag.ts
+@@ -0,0 +1,26 @@
++import { Hono } from "hono";
++import { ragFetch, RagUnavailableError } from "../lib/rag";
++
++const ragRoutes = new Hono();
++// Nama file asli: "<nama pdf SOP>_p<n>.png" -> boleh berisi spasi, kurung, huruf non-ASCII.
++// Yang ditolak: pemisah path (/ \\), karakter kontrol/NUL, awalan titik, ekstensi non-gambar.
++const okName = (n: string) =>
++  n.length > 0 && n.length <= 255 && !/[\/\\\u0000-\u001f]/.test(n) && !n.startsWith(".") && /\.(png|jpe?g|webp)$/i.test(n);
++const MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp" };
++
++// Browser pegawai tidak boleh menembak Flask langsung: gambar SOP diteruskan lewat sini.
++ragRoutes.get("/sop-image/:name", async (c) => {
++  const name = c.req.param("name");
++  if (!okName(name)) return c.json({ error: "Nama gambar tidak valid" }, 400);
++  try {
++    const up = await ragFetch(`/static/sop_images/${encodeURIComponent(name)}`, {}, false);
++    if (!up.ok) return c.json({ error: "Gambar tidak ditemukan" }, 404);
++    const ext = name.split(".").pop()!.toLowerCase();
++    return new Response(up.body, { headers: { "Content-Type": up.headers.get("content-type") ?? MIME[ext], "Cache-Control": "public, max-age=86400" } });
++  } catch (e) {
++    if (e instanceof RagUnavailableError) return c.json({ error: "Layanan RAG tidak terjangkau" }, 502);
++    throw e;
++  }
++});
++
++export { ragRoutes };

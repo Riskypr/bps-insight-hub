@@ -1,10 +1,23 @@
 import { zValidator } from "@hono/zod-validator";
+import type { Context } from "hono";
 import { Hono } from "hono";
 import { z } from "zod";
+import {
+  RagAuthError,
+  RagBusyError,
+  formatRagAnswer,
+  ragAsk,
+  ragEnabled,
+  ragSseResponse,
+} from "../lib/rag";
 
-// ── Backend Python (chat.py) Configuration ──
+// ── Python LLM & RAG Backend (chat.py) Configuration ──
 const CHAT_PY_URL =
   process.env.CHAT_PY_URL ?? process.env.PYTHON_BACKEND_URL ?? "http://localhost:5000";
+
+// ── Model umum (OpenAI-compatible), hanya dipakai saat RAG gagal/dimatikan ──
+const AI_BASE = (process.env["AI_API_BASE"] ?? "http://localhost:20128/v1").replace(/\/+$/, "");
+const AI_MODEL = process.env["AI_API_MODEL"] ?? "default";
 
 const chatRoutes = new Hono();
 
@@ -82,6 +95,140 @@ function formatSources(sources?: any[]) {
   }));
 }
 
+// ── Fallback ke model umum (dipakai saat RAG gagal/dimatikan) ────────────────
+type AiMessage = { role: "system" | "user" | "assistant"; content: string };
+
+function aiHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const key = process.env["AI_API_KEY"];
+  if (key) headers["Authorization"] = `Bearer ${key}`;
+  return headers;
+}
+
+function textOnly(content: string | Array<{ type: string; text?: string | undefined }>): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((p) => p.type === "text")
+    .map((p) => p.text ?? "")
+    .join("\n")
+    .trim();
+}
+
+/** Riwayat (teks saja) + pertanyaan terakhir, dalam bentuk yang dimengerti API model umum. */
+function fallbackMessages(
+  messages:
+    | Array<{
+        role: "system" | "user" | "assistant";
+        content: string | Array<{ type: string; text?: string | undefined }>;
+      }>
+    | undefined,
+  question: string,
+): AiMessage[] {
+  const list: AiMessage[] = (messages ?? [])
+    .map((m) => ({ role: m.role, content: textOnly(m.content) }))
+    .filter((m) => m.content.length > 0);
+  const last = list[list.length - 1];
+  if (last && last.role === "user") last.content = question;
+  else list.push({ role: "user", content: question });
+  return list;
+}
+
+const SSE_HEADERS = {
+  "Content-Type": "text/event-stream",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+} as const;
+
+function sseSingle(conversationId: string, content: string): Response {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(enc.encode(`data: ${JSON.stringify({ conversationId })}\n\n`));
+      controller.enqueue(
+        enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`),
+      );
+      controller.enqueue(enc.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(stream, { headers: SSE_HEADERS });
+}
+
+async function callGeneralAi(messages: AiMessage[]): Promise<{ text: string; usage: unknown }> {
+  const res = await fetch(`${AI_BASE}/chat/completions`, {
+    method: "POST",
+    headers: aiHeaders(),
+    body: JSON.stringify({ model: AI_MODEL, messages, stream: false }),
+  });
+  if (!res.ok) throw new Error(`model umum merespons ${res.status}`);
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: unknown;
+  };
+  return { text: data.choices?.[0]?.message?.content ?? "", usage: data.usage ?? null };
+}
+
+/** Jawaban model umum dipotong sama format SSE lama: conversationId -> token -> [DONE]. */
+async function streamGeneralAi(messages: AiMessage[], conversationId: string): Promise<Response> {
+  const aiRes = await fetch(`${AI_BASE}/chat/completions`, {
+    method: "POST",
+    headers: aiHeaders(),
+    body: JSON.stringify({ model: AI_MODEL, messages, stream: true }),
+  });
+  if (!aiRes.ok || !aiRes.body) {
+    const detail = await aiRes.text().catch(() => "");
+    return sseSingle(conversationId, `Model umum tidak dapat diakses (${aiRes.status}). ${detail}`);
+  }
+
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const upstream = aiRes.body;
+  const stream = new ReadableStream({
+    async start(controller) {
+      controller.enqueue(enc.encode(`data: ${JSON.stringify({ conversationId })}\n\n`));
+      const reader = upstream.getReader();
+      let sawDone = false;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = dec.decode(value, { stream: true });
+          if (chunk.includes("[DONE]")) sawDone = true;
+          controller.enqueue(enc.encode(chunk));
+        }
+      } catch {
+        // koneksi putus di tengah: tutup stream apa adanya
+      }
+      if (!sawDone) controller.enqueue(enc.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(stream, { headers: SSE_HEADERS });
+}
+
+/**
+ * Galat RAG yang TIDAK boleh di-fallback (antre / key salah) -> Response awal;
+ * selain itu null supaya lanjut ke fallback model umum.
+ */
+function ragErrorResponse(c: Context, e: unknown): Response | null {
+  if (e instanceof RagBusyError) {
+    return c.json(
+      {
+        error: "rag_sibuk",
+        retry_after: e.retryAfter,
+        message: `Server sedang antre, coba lagi sekitar ${e.retryAfter} detik.`,
+      },
+      503,
+      { "Retry-After": String(e.retryAfter) },
+    );
+  }
+  if (e instanceof RagAuthError) {
+    return c.json({ error: "rag_auth", message: "Key layanan RAG ditolak. Hubungi admin." }, 502);
+  }
+  console.error("RAG gagal, memakai model umum:", e);
+  return null;
+}
+
 // ── GET /chat/status (Check Python chat.py backend health) ──
 chatRoutes.get("/status", async (c) => {
   try {
@@ -115,6 +262,39 @@ chatRoutes.post(
 
     if (!question) {
       return c.json({ error: "Pertanyaan tidak boleh kosong." }, 400);
+    }
+
+    // ── Jalur utama: layanan RAG (chatbot BPS Kalteng) ──
+    if (ragEnabled()) {
+      try {
+        const answer = await ragAsk(question);
+        return c.json({
+          id: crypto.randomUUID(),
+          conversationId,
+          text: formatRagAnswer(answer),
+          usage: null,
+          via: "rag",
+          createdAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        const early = ragErrorResponse(c, err);
+        if (early) return early;
+        try {
+          const { text, usage } = await callGeneralAi(fallbackMessages(body.messages, question));
+          return c.json({
+            id: crypto.randomUUID(),
+            conversationId,
+            text,
+            usage,
+            via: "fallback",
+            createdAt: new Date().toISOString(),
+          });
+        } catch (fallbackErr) {
+          console.error("[AI Fallback Error]:", fallbackErr);
+          const detail = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+          return c.json({ error: "Gagal menghubungi layanan RAG dan model umum", detail }, 502);
+        }
+      }
     }
 
     try {
@@ -185,6 +365,27 @@ chatRoutes.post(
 
     if (!question) {
       return c.json({ error: "Pertanyaan tidak boleh kosong." }, 400);
+    }
+
+    // ── Jalur utama: layanan RAG (jawaban datang utuh, Hub yang memotong) ──
+    if (ragEnabled()) {
+      try {
+        const answer = await ragAsk(question);
+        return ragSseResponse(formatRagAnswer(answer), conversationId);
+      } catch (err) {
+        const early = ragErrorResponse(c, err);
+        if (early) return early;
+        try {
+          return await streamGeneralAi(fallbackMessages(body.messages, question), conversationId);
+        } catch (fallbackErr) {
+          console.error("[AI Fallback Stream Error]:", fallbackErr);
+          const detail = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+          return sseSingle(
+            conversationId,
+            `Tidak dapat terhubung ke layanan RAG maupun model umum.\n\n${detail}`,
+          );
+        }
+      }
     }
 
     try {

@@ -1,8 +1,63 @@
-# Laporan Progress Integrasi AI Chat Engine: LLM Python RAG (`chat.py`)
+# Laporan Progress Integrasi AI — BPS Insight Hub (Kalimantan Tengah)
 
-Dokumen ini mencatat pelacakan status migrasi model AI dari **AI Chat Completion API eksternal** ke **Python RAG Pipeline Lokal (`back-end/chat.py`)** untuk aplikasi **BPS Insight Hub (Provinsi Kalimantan Tengah)**.
+Dokumen ini adalah **satu-satunya catatan progress** integrasi AI di repo ini, disusun dari yang terbaru ke yang paling lama, agar agent/manusia lain bisa mengetahui perubahan (penambahan / perubahan / penghapusan) dengan cepat.
+
+- **Fase terbaru** — Integrasi RAG Chatbot BPS Kalteng (Hub ↔ layanan RAG Flask): ada di bagian pertama setelah garis pemisah.
+- **Fase 1 (riwayat)** — Migrasi dari AI Chat Completion API eksternal ke Python RAG Pipeline lokal (`back-end/chat.py`): ada di bagian bawah.
 
 ---
+
+# 🆕 FASE TERBARU (2026-10-02) — Integrasi RAG Chatbot BPS Kalteng
+
+> **Baca bagian ini dulu.** Rincian perubahan per file ada di bawah; fase lama (proxy ke `chat.py`) tetap berlaku dan ada di bagian paling bawah dokumen.
+
+**Sumber requirements:** `test_risky_ajudan/paket_RAG_BPS_Kalteng/` — mulai dari `BACA_DULU.md`, lalu `2_HUB_TES_INTEGRASI/00_BACA_DULU_PANDUAN.md`. Kontrak API: `KONTRAK_API_RAG.md`.
+
+### ✅ Status verifikasi
+
+| Pemeriksaan | Hasil |
+| :--- | :--- |
+| `npm test` (40 tes integrasi Hub ↔ RAG) | ✅ **40/40 lulus** |
+| `npm run build` | ✅ Sukses |
+| `npx tsc --noEmit` (folder `api/`) | ✅ 23 error = **sama dengan baseline** (tidak ada error baru) |
+| `npx eslint api/lib/rag.ts api/routes/rag.ts` | ✅ Bersih |
+| `npm run lint` (seluruh repo) | ⚠️ Tetap gagal — **gagal sejak baseline** (576 error prettier/CRLF, bukan akibat perubahan ini) |
+| Uji gabungan dengan backend RAG asli (Ollama/Qdrant/Flask) | ⏳ **Belum dilakukan** |
+
+### 📁 Perubahan per file
+
+| Berkas | Aksi | Ringkasan perubahan |
+| :--- | :---: | :--- |
+| `api/lib/rag.ts` | **BARU** | Klien RAG: `ragFetch` (header `Bearer` + `AbortSignal.timeout(RAG_TIMEOUT_MS)`), `ragAsk` (`POST /api/ask`), `ragIngest` (`POST /api/ingest`), `formatRagAnswer`, `ragSseResponse`. Kelas galat: `RagBusyError` (antre), `RagAuthError` (401), `RagUnavailableError` (mati/timeout/5xx). Konfigurasi dibaca dari env **saat dipanggil**. |
+| `api/routes/rag.ts` | **BARU** | Proxy gambar SOP `GET /rag/sop-image/:name` → `GET {RAG}/static/sop_images/<nama>`. Menolak pemisah path (`/` `\`), karakter kontrol/NUL/DEL, awalan titik, ekstensi selain png/jpg/jpeg/webp. **Nama ber-spasi tetap diterima** (didecode lalu di-encode ulang) — validasi `[A-Za-z0-9._-]` sengaja tidak dipakai. |
+| `api/index.ts` | **UBAH** | +2 baris: import & `app.route("/rag", ragRoutes)`. |
+| `api/routes/chat.ts` | **UBAH** | `/chat/send` dan `/chat/stream` kini mencoba RAG lebih dulu bila `RAG_API_BASE` terisi. `503 server_sibuk` → `503 {error:"rag_sibuk", retry_after}` + header `Retry-After` (**tanpa retry & tanpa fallback**); `401` → `502` (**tanpa fallback diam-diam**); selain itu fallback ke `AI_API_BASE` dengan `via:"fallback"`. Baris `- ` → `* ` (frontend `extractSuggestions` memotong `- `). `featured_image` → blok ` ```image ` yang URL-nya lewat proxy Hub. Riwayat: hanya teks pesan user **terakhir** yang dikirim. Ditambah: helper `callGeneralAi` / `streamGeneralAi` / `sseSingle` / `ragErrorResponse`. |
+| `api/routes/pdfs.ts` | **UBAH** | Setiap PDF diteruskan ke `/api/ingest` dengan **nama file asli** + `title`/`uploader`(`x-user-id`)/`replace`. Hasil per file kini memuat `ragJobId` & `ragStatus`: 202→`PENDING`, 200 `SKIPPED`→`SKIPPED`+alasan, 409 isi sama→`DUPLICATE`, 409 nama sama→`NAME_CONFLICT`+`existingChunks`, RAG mati→`UNAVAILABLE` (**file tetap tersimpan di Hub**). Route baru `GET /v1/pdfs/rag-jobs/:jobId` (validasi `^[A-Za-z0-9_-]{1,64}$`, 404 bila tak ada, 502 bila RAG mati). |
+| `.env.example` | **UBAH** | +`RAG_API_BASE` (kosong = fitur mati), `RAG_API_KEY`, `RAG_TIMEOUT_MS=180000`, `PUBLIC_API_PREFIX=/api`. |
+| `tests/`, `vitest.config.ts` | **BARU** | Disalin dari paket serah terima (isi tes **tidak diubah**, blok `CFG` tidak disentuh). |
+| `package.json` | **UBAH** | `"test": "vitest run"` + devDependency `vitest`. |
+| `test_risky_ajudan/` | **BARU** | Paket serah terima dari pemilik backend (dokumen + tes + server tiruan). |
+
+**Penghapusan:** tidak ada file yang dihapus pada fase ini.
+
+### 🧠 Hal yang perlu diketahui agent lain
+
+1. **Jalur lama tidak dilepas.** Selama `RAG_API_BASE` kosong (kondisi `.env` lokal saat ini), `chat.ts` tetap memakai `CHAT_PY_URL`/`chat.py` persis seperti sebelumnya. RAG hanya aktif saat env diisi.
+2. **`RAG_API_KEY` hanya boleh ada di server Hub**, tidak boleh sampai ke respons/browsers (dicegah tes A10 & E11).
+3. **Frontend (`src/`) belum disentuh sama sekali.** UI polling `rag-jobs`, tombol "ganti versi" (NAME_CONFLICT), dan "kirim ulang" (UNAVAILABLE) belum ada.
+4. **Prisma tidak ditambahi query baru**, jadi mock `vi.mock("../api/lib/prisma")` di tes tidak perlu diubah.
+5. **Keputusan yang masih terbuka** (dari panduan bagian 6): kolom `ragJobId` permanen di `PdfFile`, sinkron hapus Hub→chatbot, batas 25 MB (Hub) vs 100 MB (RAG), nasib file `SKIPPED`/`DUPLICATE`/`NAME_CONFLICT` (implementasi contoh: **tidak disimpan** di Hub), dan `/chat/upload`.
+6. **Cara verifikasi ulang:** `npm test` (harus 40/40). Kalau gagal, jangan melemahkan tes — lihat `00_BACA_DULU_PANDUAN.md` bagian 4.
+
+### ⏳ Langkah berikutnya
+
+1. Isi `RAG_API_BASE` + `RAG_API_KEY` di `.env`, jalankan backend RAG asli, lalu `docker compose up -d app` (lihat `1_BACKEND_RAG/PANDUAN_PINDAH_KE_SERVER_untuk_atasan.md`).
+2. Uji manual: 1 pertanyaan publikasi, 1 SOP (harus ada gambar), 1 PDF publikasi, 1 PDF acak (harus `SKIPPED`).
+3. Kirim hasil `npx vitest run` + catatan uji manual ke pemilik backend, lalu uji gabungan dengan `uji_backend_rag.py`.
+
+---
+
+# 📜 Fase 1 (riwayat) — Integrasi AI Chat Engine: LLM Python RAG (`chat.py`)
 
 ## 📊 Ringkasan Status
 
