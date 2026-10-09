@@ -11,7 +11,9 @@ Dokumen ini adalah **satu-satunya catatan progress** integrasi AI di repo ini, d
 
 > **Baca bagian ini dulu.** Rincian perubahan per file ada di bawah; fase lama (proxy ke `chat.py`) tetap berlaku dan ada di bagian paling bawah dokumen.
 
-**Sumber requirements:** `test_risky_ajudan/paket_RAG_BPS_Kalteng/` — mulai dari `BACA_DULU.md`, lalu `2_HUB_TES_INTEGRASI/00_BACA_DULU_PANDUAN.md`. Kontrak API: `KONTRAK_API_RAG.md`.
+**Sumber requirements:** paket serah terima `paket_RAG_BPS_Kalteng/` — mulai dari `BACA_DULU.md`, lalu `2_HUB_TES_INTEGRASI/00_BACA_DULU_PANDUAN.md`. Kontrak API: `KONTRAK_API_RAG.md`.
+
+> **2026-10-09 — penghapusan di repo:** salinan lama `test_risky_ajudan/paket_RAG_BPS_Kalteng/` dan `prd_backend_management.md` dihapus dari working tree dan di-commit. Paket v1.0.2 yang semula ada di root `paket_RAG_BPS_Kalteng/` ikut hilang dari disk dan **tidak ada di riwayat git** — bila masih diperlukan, ambil dari salinan luar repo; tes yang terpasang di repo tetap `tests/` (40/40 lulus).
 
 ### ✅ Status verifikasi
 
